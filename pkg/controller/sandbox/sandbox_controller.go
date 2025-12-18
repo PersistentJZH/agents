@@ -160,7 +160,10 @@ func (r *SandboxReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			utils.SetSandboxCondition(newStatus, *cond)
 		}
 		// If it is paused, first set the sandbox to the Paused state.
+		// To prevent loss of state information, the state immediately before Paused must currently be Running.
 	} else if box.Spec.Paused && box.Status.Phase == agentsv1alpha1.SandboxRunning {
+		// The paused and resumed condition are exclusive
+		utils.RemoveSandboxCondition(newStatus, string(agentsv1alpha1.SandboxConditionResumed))
 		newStatus.Phase = agentsv1alpha1.SandboxPaused
 		// enter resume phase
 	} else if !box.Spec.Paused && newStatus.Phase == agentsv1alpha1.SandboxPaused {

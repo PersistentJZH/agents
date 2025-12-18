@@ -10,7 +10,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/klog/v2"
-	"k8s.io/utils/pointer"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
@@ -93,15 +93,17 @@ func (r *commonControl) EnsureSandboxPhasePaused(ctx context.Context, args Ensur
 	}
 
 	// The paused phase sets condition ready to false.
-	if rCond := utils.GetSandboxCondition(newStatus, string(agentsv1alpha1.SandboxConditionReady)); rCond.Status == metav1.ConditionTrue {
+	if rCond := utils.GetSandboxCondition(newStatus, string(agentsv1alpha1.SandboxConditionReady)); rCond != nil && rCond.Status == metav1.ConditionTrue {
 		rCond.Status = metav1.ConditionFalse
 		rCond.LastTransitionTime = metav1.Now()
 		utils.SetSandboxCondition(newStatus, *rCond)
 	}
 
 	// Pod deletion completed, paused completed
-	if pod == nil {
+	// cond.Status == metav1.ConditionFalse just for sure
+	if pod == nil && cond.Status == metav1.ConditionFalse {
 		cond.Status = metav1.ConditionTrue
+		cond.LastTransitionTime = metav1.Now()
 		utils.SetSandboxCondition(newStatus, *cond)
 		return nil
 	}
@@ -110,7 +112,7 @@ func (r *commonControl) EnsureSandboxPhasePaused(ctx context.Context, args Ensur
 		logger.Info("Sandbox wait pod paused")
 		return nil
 	}
-	err := client.IgnoreNotFound(r.Delete(ctx, pod, &client.DeleteOptions{GracePeriodSeconds: pointer.Int64(30)}))
+	err := client.IgnoreNotFound(r.Delete(ctx, pod, &client.DeleteOptions{GracePeriodSeconds: ptr.To(int64(30))}))
 	if err != nil {
 		logger.Error(err, "Delete pod failed")
 		return err
@@ -121,11 +123,25 @@ func (r *commonControl) EnsureSandboxPhasePaused(ctx context.Context, args Ensur
 
 func (r *commonControl) EnsureSandboxPhaseResuming(ctx context.Context, args EnsureFuncArgs) error {
 	pod, box, newStatus := args.Pod, args.Box, args.NewStatus
+
+	// Consider the scenario where a pod is paused and immediately resumed,
+	// pod phase may be Running, but the actual state could be Terminating.
+	if pod != nil && !pod.DeletionTimestamp.IsZero() {
+		return fmt.Errorf("the pods created in the previous stage are still in the terminating state.")
+	}
+
 	// first create pod
 	var err error
 	if pod == nil {
 		_, err = r.createPod(ctx, box, newStatus)
 		return err
+	}
+
+	// create pod success, set resumed condition to true
+	if resumedCond := utils.GetSandboxCondition(newStatus, string(agentsv1alpha1.SandboxConditionResumed)); resumedCond != nil && resumedCond.Status == metav1.ConditionFalse {
+		resumedCond.Status = metav1.ConditionTrue
+		resumedCond.LastTransitionTime = metav1.Now()
+		utils.SetSandboxCondition(newStatus, *resumedCond)
 	}
 
 	if pod.Status.Phase == corev1.PodRunning {
