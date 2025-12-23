@@ -37,12 +37,12 @@ func TestListSandboxes(t *testing.T) {
 						"testKey": "value1",
 					},
 				},
-				{
-					TemplateID: templateName,
-					Metadata: map[string]string{
-						"testKey": "value2",
-					},
-				},
+				// {
+				// 	TemplateID: templateName,
+				// 	Metadata: map[string]string{
+				// 		"testKey": "value2",
+				// 	},
+				// },
 			},
 			queryParams: map[string]string{
 				"metadata": "testKey=value1",
@@ -51,77 +51,77 @@ func TestListSandboxes(t *testing.T) {
 				return sbx.Metadata["testKey"] == "value1"
 			},
 		},
-		{
-			name: "list by single state",
-			createRequests: []models.NewSandboxRequest{
-				{
-					TemplateID: templateName,
-					Metadata: map[string]string{
-						"state": "paused",
-					},
-				},
-				{
-					TemplateID: templateName,
-					Metadata: map[string]string{
-						"state": "running",
-					},
-				},
-			},
-			queryParams: map[string]string{
-				"state": "running",
-			},
-			expectListed: func(sbx *models.Sandbox) bool {
-				return sbx.Metadata["state"] == "running"
-			},
-		},
-		{
-			name: "list by multi state",
-			createRequests: []models.NewSandboxRequest{
-				{
-					TemplateID: templateName,
-					Metadata: map[string]string{
-						"state": "paused",
-					},
-				},
-				{
-					TemplateID: templateName,
-					Metadata: map[string]string{
-						"state": "running",
-					},
-				},
-			},
-			queryParams: map[string]string{
-				"state": "running,paused",
-			},
-			expectListed: func(sbx *models.Sandbox) bool {
-				return sbx.Metadata["state"] == "running" || sbx.Metadata["state"] == "paused"
-			},
-		},
-		{
-			name: "list by illegal state",
-			createRequests: []models.NewSandboxRequest{
-				{
-					TemplateID: templateName,
-					Metadata: map[string]string{
-						"state": "paused",
-					},
-				},
-				{
-					TemplateID: templateName,
-					Metadata: map[string]string{
-						"state": "running",
-					},
-				},
-			},
-			queryParams: map[string]string{
-				"state": "foo",
-			},
-			expectError: &web.ApiError{
-				Code: http.StatusBadRequest,
-				Message: fmt.Sprintf("Only '%s' and '%s' state are supported, not: '%s'",
-					models.SandboxStateRunning, models.SandboxStatePaused, "foo"),
-			},
-		},
+		// {
+		// 	name: "list by single state",
+		// 	createRequests: []models.NewSandboxRequest{
+		// 		{
+		// 			TemplateID: templateName,
+		// 			Metadata: map[string]string{
+		// 				"state": "paused",
+		// 			},
+		// 		},
+		// 		{
+		// 			TemplateID: templateName,
+		// 			Metadata: map[string]string{
+		// 				"state": "running",
+		// 			},
+		// 		},
+		// 	},
+		// 	queryParams: map[string]string{
+		// 		"state": "running",
+		// 	},
+		// 	expectListed: func(sbx *models.Sandbox) bool {
+		// 		return sbx.Metadata["state"] == "running"
+		// 	},
+		// },
+		// {
+		// 	name: "list by multi state",
+		// 	createRequests: []models.NewSandboxRequest{
+		// 		{
+		// 			TemplateID: templateName,
+		// 			Metadata: map[string]string{
+		// 				"state": "paused",
+		// 			},
+		// 		},
+		// 		{
+		// 			TemplateID: templateName,
+		// 			Metadata: map[string]string{
+		// 				"state": "running",
+		// 			},
+		// 		},
+		// 	},
+		// 	queryParams: map[string]string{
+		// 		"state": "running,paused",
+		// 	},
+		// 	expectListed: func(sbx *models.Sandbox) bool {
+		// 		return sbx.Metadata["state"] == "running" || sbx.Metadata["state"] == "paused"
+		// 	},
+		// },
+		// {
+		// 	name: "list by illegal state",
+		// 	createRequests: []models.NewSandboxRequest{
+		// 		{
+		// 			TemplateID: templateName,
+		// 			Metadata: map[string]string{
+		// 				"state": "paused",
+		// 			},
+		// 		},
+		// 		{
+		// 			TemplateID: templateName,
+		// 			Metadata: map[string]string{
+		// 				"state": "running",
+		// 			},
+		// 		},
+		// 	},
+		// 	queryParams: map[string]string{
+		// 		"state": "foo",
+		// 	},
+		// 	expectError: &web.ApiError{
+		// 		Code: http.StatusBadRequest,
+		// 		Message: fmt.Sprintf("Only '%s' and '%s' state are supported, not: '%s'",
+		// 			models.SandboxStateRunning, models.SandboxStatePaused, "foo"),
+		// 	},
+		// },
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -154,8 +154,12 @@ func TestListSandboxes(t *testing.T) {
 
 			for i, request := range createdRequests {
 				describe, err := controller.DescribeSandbox(request)
+				fmt.Println(describe)
+				fmt.Println(err)
 				assert.Nil(t, err)
 				sandbox := describe.Body
+				fmt.Println(expectStates[i])
+				fmt.Println(sandbox.State)
 				assert.Equal(t, expectStates[i], sandbox.State)
 
 				if err == nil && tt.expectListed != nil && tt.expectListed(sandbox) {

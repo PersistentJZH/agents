@@ -8,6 +8,7 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/onsi/ginkgo/v2 v2.23.4
 	github.com/onsi/gomega v1.36.3
+	github.com/spf13/pflag v1.0.6
 	github.com/stretchr/testify v1.11.1
 	google.golang.org/grpc v1.75.1
 	k8s.io/api v0.33.0
@@ -15,6 +16,7 @@ require (
 	k8s.io/apiserver v0.33.0
 	k8s.io/client-go v1.5.2
 	k8s.io/code-generator v0.33.0
+	k8s.io/component-base v0.33.0
 	k8s.io/klog/v2 v2.130.1
 	k8s.io/kubernetes v1.33.0
 	k8s.io/utils v0.0.0-20241104100929-3ea5e8cea738
@@ -66,7 +68,6 @@ require (
 	github.com/prometheus/common v0.62.0 // indirect
 	github.com/prometheus/procfs v0.16.0 // indirect
 	github.com/spf13/cobra v1.8.1 // indirect
-	github.com/spf13/pflag v1.0.6 // indirect
 	github.com/stoewer/go-strcase v1.3.0 // indirect
 	github.com/x448/float16 v0.8.4 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.0 // indirect
@@ -101,7 +102,6 @@ require (
 	gopkg.in/inf.v0 v0.9.1 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 	k8s.io/apiextensions-apiserver v0.33.0 // indirect
-	k8s.io/component-base v0.33.0 // indirect
 	k8s.io/component-helpers v0.33.0 // indirect
 	k8s.io/controller-manager v0.33.0 // indirect
 	k8s.io/gengo/v2 v2.0.0-20250207200755-1244d31929d7 // indirect
@@ -115,3 +115,37 @@ require (
 )
 
 replace k8s.io/client-go => k8s.io/client-go v0.33.0
+
+replace k8s.io/cli-runtime v0.0.0 => k8s.io/cli-runtime v0.33.0
+
+replace k8s.io/cloud-provider v0.0.0 => k8s.io/cloud-provider v0.33.0
+
+replace k8s.io/cluster-bootstrap v0.0.0 => k8s.io/cluster-bootstrap v0.33.0
+
+replace k8s.io/cri-client v0.0.0 => k8s.io/cri-client v0.33.0
+
+replace k8s.io/csi-translation-lib v0.0.0 => k8s.io/csi-translation-lib v0.33.0
+
+replace k8s.io/dynamic-resource-allocation v0.0.0 => k8s.io/dynamic-resource-allocation v0.33.0
+
+replace k8s.io/endpointslice v0.0.0 => k8s.io/endpointslice v0.33.0
+
+replace k8s.io/externaljwt v0.0.0 => k8s.io/externaljwt v0.33.0
+
+replace k8s.io/kube-aggregator v0.0.0 => k8s.io/kube-aggregator v0.33.0
+
+replace k8s.io/kube-controller-manager v0.0.0 => k8s.io/kube-controller-manager v0.33.0
+
+replace k8s.io/kube-proxy v0.0.0 => k8s.io/kube-proxy v0.33.0
+
+replace k8s.io/kube-scheduler v0.0.0 => k8s.io/kube-scheduler v0.33.0
+
+replace k8s.io/kubectl v0.0.0 => k8s.io/kubectl v0.33.0
+
+replace k8s.io/metrics v0.0.0 => k8s.io/metrics v0.33.0
+
+replace k8s.io/mount-utils v0.0.0 => k8s.io/mount-utils v0.33.0
+
+replace k8s.io/pod-security-admission v0.0.0 => k8s.io/pod-security-admission v0.33.0
+
+replace k8s.io/sample-apiserver v0.0.0 => k8s.io/sample-apiserver v0.33.0

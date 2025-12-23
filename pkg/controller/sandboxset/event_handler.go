@@ -68,6 +68,10 @@ func (e *SandboxEventHandler) Delete(_ context.Context, evt event.TypedDeleteEve
 		scaleDownExpectation.ObserveScale(req.String(), expectations.Delete, evt.Object.GetName())
 		w.Add(req)
 	}
+	// Delete cache when sandbox is deleted
+	if sbx, ok := evt.Object.(*agentsv1alpha1.Sandbox); ok {
+		stateutils.DeleteSandboxCache(sbx.Namespace, sbx.Name)
+	}
 }
 
 func (e *SandboxEventHandler) Generic(context.Context, event.TypedGenericEvent[client.Object], workqueue.TypedRateLimitingInterface[reconcile.Request]) {
