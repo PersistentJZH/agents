@@ -5,13 +5,17 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync/atomic"
 
 	sandboxclient "github.com/openkruise/agents/client/clientset/versioned"
 	sandboxfake "github.com/openkruise/agents/client/clientset/versioned/fake"
 	"github.com/openkruise/agents/pkg/sandbox-manager/consts"
+	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
 	k8sfake "k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/util/homedir"
 	"k8s.io/klog/v2"
@@ -97,6 +101,95 @@ func NewClientSet(infra string) (*ClientSet, error) {
 func NewFakeClientSet() *ClientSet {
 	client := &ClientSet{}
 	client.K8sClient = k8sfake.NewClientset()
-	client.SandboxClient = sandboxfake.NewSimpleClientset()
+
+	// Create fake sandbox client
+	fakeSandboxClient := sandboxfake.NewSimpleClientset()
+	client.SandboxClient = fakeSandboxClient
+
+	// Add reactor to auto-increment ResourceVersion for fake client
+	// This simulates real Kubernetes API server behavior in tests
+	AddResourceVersionReactor(fakeSandboxClient)
+
 	return client
+}
+
+// AddResourceVersionReactor adds a reactor to fake client that auto-increments ResourceVersion
+// on create/update operations, simulating real Kubernetes API server behavior.
+//
+// Background:
+// - Real K8s API server automatically increments ResourceVersion on every update
+// - Fake client doesn't do this by default, causing issues with cache keys that include RV
+// - This reactor intercepts create/update actions and ensures RV is incremented
+//
+// Usage:
+//
+//	client := sandboxfake.NewSimpleClientset()
+//	AddResourceVersionReactor(client)
+func AddResourceVersionReactor(fakeClient *sandboxfake.Clientset) {
+	// Counter for generating unique ResourceVersions
+	// Start from 1 to match test helper functions like AvoidGetFromCache (which uses "100")
+	var resourceVersionCounter int64 = 1
+
+	// PrependReactor adds a reactor that runs BEFORE the default fake client logic
+	// This allows us to intercept and modify objects before they're stored
+	fakeClient.PrependReactor("create", "*", func(action testing.Action) (handled bool, ret runtime.Object, err error) {
+		createAction, ok := action.(testing.CreateAction)
+		if !ok {
+			return false, nil, nil
+		}
+
+		obj := createAction.GetObject()
+		if obj == nil {
+			return false, nil, nil
+		}
+
+		// Get metav1.Object interface to access/modify metadata
+		metaObj, err := meta.Accessor(obj)
+		if err != nil {
+			return false, nil, err
+		}
+
+		// If ResourceVersion is empty or "0", assign initial version
+		rv := metaObj.GetResourceVersion()
+		if rv == "" || rv == "0" {
+			newRV := atomic.AddInt64(&resourceVersionCounter, 1)
+			metaObj.SetResourceVersion(strconv.FormatInt(newRV, 10))
+		}
+
+		// Return false to continue with default fake client logic
+		return false, nil, nil
+	})
+
+	fakeClient.PrependReactor("update", "*", func(action testing.Action) (handled bool, ret runtime.Object, err error) {
+		updateAction, ok := action.(testing.UpdateAction)
+		if !ok {
+			return false, nil, nil
+		}
+
+		obj := updateAction.GetObject()
+		if obj == nil {
+			return false, nil, nil
+		}
+
+		// Get metav1.Object interface
+		metaObj, err := meta.Accessor(obj)
+		if err != nil {
+			return false, nil, err
+		}
+
+		// Always increment ResourceVersion on update
+		newRV := atomic.AddInt64(&resourceVersionCounter, 1)
+		metaObj.SetResourceVersion(strconv.FormatInt(newRV, 10))
+
+		// Return false to continue with default fake client logic
+		return false, nil, nil
+	})
+}
+
+// GetCurrentResourceVersion returns the current resource version counter value
+// Useful for debugging in tests
+func GetCurrentResourceVersion() int64 {
+	// Note: This requires the counter to be accessible, which would need refactoring
+	// For now, this is just a placeholder
+	return 0
 }
