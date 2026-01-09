@@ -33,8 +33,8 @@ kind: SandboxClaim
 metadata:
   name: user-sandbox
 spec:
-  sandboxSetName: python-pool
-  shutdownTime: 3600
+  templateName: python-pool
+  shutdownTime: "2025-12-30T12:00:00Z"
   envVars:
     API_KEY: "sk-..."
 ```
@@ -49,8 +49,29 @@ kind: SandboxClaim
 metadata:
   name: test-batch
 spec:
-  sandboxSetName: test-pool
+  templateName: test-pool
   replicas: 10
+```
+
+#### Story 3: Claim with Timeout and Auto Cleanup
+
+I want to claim sandboxes with a timeout, and automatically clean up the claim after completion.
+
+```yaml
+apiVersion: agents.kruise.io/v1alpha1
+kind: SandboxClaim
+metadata:
+  name: timed-claim
+spec:
+  templateName: python-pool
+  replicas: 5
+  timeout: 10m  # Wait up to 10 minutes to claim sandboxes
+  ttlAfterCompleted: 1h  # Auto-delete the claim 1 hour after completion
+  labels:
+    project: "my-project"
+    environment: "test"
+  annotations:
+    claim-purpose: "integration-test"
 ```
 
 ### API Design
@@ -60,32 +81,46 @@ spec:
 ```go
 // SandboxClaimSpec defines the desired state of SandboxClaim
 type SandboxClaimSpec struct {
-    // SandboxSetName specifies which SandboxSet pool to claim from
+    // TemplateName specifies which SandboxSet pool to claim from
     // +kubebuilder:validation:Required
-    SandboxSetName string `json:"sandboxSetName"`
-
-    // Owner identifies who is claiming the sandbox (e.g., user ID, service account)
-    // This will be set as the agents.kruise.io/owner annotation on claimed sandboxes
-    // If not specified, defaults to "<namespace>/<claim-name>"
-    // +optional
-    Owner string `json:"owner,omitempty"`
+    TemplateName string `json:"templateName"`
 
     // Replicas specifies how many sandboxes to claim (default: 1)
     // For batch claiming support
+    // This field is immutable once set
     // +optional
     // +kubebuilder:default=1
     // +kubebuilder:validation:Minimum=1
-    Replicas int32 `json:"replicas,omitempty"`
+    // +kubebuilder:validation:XValidation:rule="self == oldSelf",message="replicas is immutable"
+    // TODO: XValidation may not work in older Kubernetes versions. Consider using webhook validation for better compatibility.
+    Replicas *int32 `json:"replicas,omitempty"`
 
-    // ShutdownTime specifies the lifetime of claimed sandboxes in seconds
-    // This will be converted to spec.shutdownTime (absolute time) on the Sandbox
+    // ShutdownTime specifies the absolute time when the sandbox should be shut down
+    // This will be set as spec.shutdownTime (absolute time) on the Sandbox
     // +optional
-    ShutdownTime *int64 `json:"shutdownTime,omitempty"`
+    ShutdownTime *metav1.Time `json:"shutdownTime,omitempty"`
 
-    // Metadata contains arbitrary key-value pairs to be added as annotations
+    // Timeout specifies the maximum duration to wait for claiming sandboxes
+    // If the timeout is reached, the claim will be marked as Completed regardless of
+    // whether all replicas were successfully claimed
+    // +optional
+    Timeout *metav1.Duration `json:"timeout,omitempty"`
+
+    // TTLAfterCompleted specifies the time to live after the claim reaches Completed phase
+    // After this duration, the SandboxClaim will be automatically deleted.
+    // Note: Only the SandboxClaim resource will be deleted; the claimed sandboxes will NOT be deleted
+    // +optional
+    TTLAfterCompleted *metav1.Duration `json:"ttlAfterCompleted,omitempty"`
+
+    // Labels contains key-value pairs to be added as labels
     // to claimed Sandbox resources
     // +optional
-    Metadata map[string]string `json:"metadata,omitempty"`
+    Labels map[string]string `json:"labels,omitempty"`
+
+    // Annotations contains key-value pairs to be added as annotations
+    // to claimed Sandbox resources
+    // +optional
+    Annotations map[string]string `json:"annotations,omitempty"`
 
     // EnvVars contains environment variables to be injected into the sandbox
     // These will be passed to the sandbox's init endpoint (envd) after claiming
@@ -101,10 +136,9 @@ type SandboxClaimStatus struct {
     ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 
     // Phase represents the current phase of the claim
-    // Pending: Waiting to claim sandboxes
-    // Claiming: In the process of claiming
-    // Ready: Successfully claimed and sandboxes are ready
-    // Failed: Failed to claim (no available sandboxes, timeout, etc.)
+    // Pending: Waiting to start claiming
+    // Claiming: In the process of claiming sandboxes
+    // Completed: Claim process finished (either all replicas claimed or timeout reached)
     // +optional
     Phase SandboxClaimPhase `json:"phase,omitempty"`
 
@@ -114,17 +148,12 @@ type SandboxClaimStatus struct {
 
     // ClaimedReplicas indicates how many sandboxes are currently claimed (total)
     // This is determined by querying sandboxes with matching ownerReference
+    // Only updated during Pending and Claiming phases
     // +optional
     ClaimedReplicas int32 `json:"claimedReplicas,omitempty"`
 
-    // ReadyReplicas indicates how many sandboxes are successfully claimed and ready
-    // +optional
-    ReadyReplicas int32 `json:"readyReplicas,omitempty"`
-
-    // Sandboxes lists all claimed sandbox instances with their details
-    // This allows upper-layer platforms to route requests to specific sandbox instances
-    // +optional
-    Sandboxes []ClaimedSandboxInfo `json:"sandboxes,omitempty"`
+    // TODO: Consider adding Sandboxes field to list claimed sandbox instances for routing.
+    // However, storing/save all sandbox infos in status may cause etcd issues when replicas count is large.
 
     // Conditions represent the current state of the SandboxClaim
     // +optional
@@ -133,42 +162,22 @@ type SandboxClaimStatus struct {
     Conditions []metav1.Condition `json:"conditions,omitempty"`
 }
 
-// ClaimedSandboxInfo contains information about a claimed sandbox instance
-type ClaimedSandboxInfo struct {
-    // Name is the Kubernetes resource name of the Sandbox
-    Name string `json:"name"`
-
-    // SandboxID is the unique identifier used for routing (e.g., "sb-abc123")
-    SandboxID string `json:"sandboxID"`
-
-    // State indicates the current state (Running, Paused, etc.)
-    State string `json:"state"`
-
-    // IP is the Pod IP address
-    // +optional
-    IP string `json:"ip,omitempty"`
-
-    // ClaimedAt is the timestamp when the sandbox was claimed
-    ClaimedAt metav1.Time `json:"claimedAt"`
-}
-
 // SandboxClaimPhase defines the phase of SandboxClaim
 // +enum
 type SandboxClaimPhase string
 
 const (
-    SandboxClaimPhasePending  SandboxClaimPhase = "Pending"
-    SandboxClaimPhaseClaiming SandboxClaimPhase = "Claiming"
-    SandboxClaimPhaseReady    SandboxClaimPhase = "Ready"
-    SandboxClaimPhaseFailed   SandboxClaimPhase = "Failed"
+    SandboxClaimPhasePending   SandboxClaimPhase = "Pending"
+    SandboxClaimPhaseClaiming  SandboxClaimPhase = "Claiming"
+    SandboxClaimPhaseCompleted SandboxClaimPhase = "Completed"
 )
 
 // SandboxClaimConditionType defines condition types
 type SandboxClaimConditionType string
 
 const (
-    // SandboxClaimConditionReady indicates if the claim is ready (all sandboxes claimed and ready)
-    SandboxClaimConditionReady SandboxClaimConditionType = "Ready"
+    // SandboxClaimConditionCompleted indicates if the claim is completed
+    SandboxClaimConditionCompleted SandboxClaimConditionType = "Completed"
 )
 
 ```
@@ -180,9 +189,8 @@ The SandboxClaim CRD is designed to align with the E2B HTTP API's `NewSandboxReq
 
 | E2B API Field | SandboxClaim Field | Status | Notes |
 |---------------|-------------------|--------|-------|
-| `templateID` | `sandboxSetName` |  implementable | Maps to SandboxSet pool name |
-| `timeout` | `shutdownTime` |  implementable | Lifetime in seconds (converted to absolute time) |
-| `metadata` | `metadata` |  implementable | Custom annotations |
+| `templateID` | `templateName` |  implementable | Maps to SandboxSet pool name |
+| `timeout` | `shutdownTime` |  implementable | Absolute shutdown time |
 | `envVars` | `envVars` | implementable | Environment variables for envd init |
 | `autoPause` | N/A |  Future Work | Not implemented in E2B Api |
 | `secure` | N/A |  Future Work | Not implemented in E2B Api |
@@ -192,21 +200,27 @@ The SandboxClaim CRD is designed to align with the E2B HTTP API's `NewSandboxReq
 ### Implementation Details
 
 **Claim Process**:
-1. List available sandboxes from the specified SandboxSet (state = `available`, filtered by `IndexPoolAvailable` index)
-2. Filter candidates by checking:
+1. Track the start time when entering `Claiming` phase (for timeout calculation)
+2. List available sandboxes from the specified SandboxSet (state = `available`, filtered by `IndexPoolAvailable` index)
+3. Filter candidates by checking:
    - `Status.Phase == Running` (sandbox must be running)
    - `AnnotationLock == ""` (pre-check to skip already-locked sandboxes)
-3. Randomly select a sandbox from candidates
-4. Update sandbox with:
+4. Randomly select a sandbox from candidates
+5. Update sandbox with:
     - Lock annotation (UUID)
-    - Owner annotation (from `claim.spec.owner`)
     - Claim timestamp annotation
-    - Custom metadata annotations (from `claim.spec.metadata`)
+    - Labels (from `claim.spec.labels`)
+    - Annotations (from `claim.spec.annotations`)
     - Remove SandboxSet ownerReference (detach from pool)
     - Add SandboxClaim ownerReference
-    - Set `spec.shutdownTime` (absolute time) if `shutdownTime` specified (converted from seconds to absolute time)
-5. Inject environment variables via envd `/init` endpoint (if `claim.spec.envVars` specified)
+    - Set `spec.shutdownTime` (absolute time) if `shutdownTime` specified
+6. Inject environment variables via envd `/init` endpoint (if `claim.spec.envVars` specified)
     - Failure to inject envVars logs error but doesn't fail the claim
+7. Check completion conditions:
+    - If `ClaimedReplicas == spec.replicas`: transition to `Completed`
+    - If `spec.timeout` is set and exceeded: transition to `Completed` (regardless of claimed count)
+    - If SandboxSet is deleted: transition to `Completed` immediately
+8. If `spec.ttlAfterCompleted` is set and claim is `Completed`, schedule deletion after the TTL duration
 
 **Conflict Handling**:
 The claim process uses **optimistic locking** via Kubernetes resourceVersion to handle concurrent claims:
@@ -225,11 +239,10 @@ The claim process uses **optimistic locking** via Kubernetes resourceVersion to 
     - Returns without error to trigger next reconcile
     - On next reconcile, the candidate list will exclude the already-claimed sandbox
   - **Continuous Reconciliation**: Controller keeps reconciling until:
-    - **Success**: All required sandboxes are claimed (transitions to `Ready` phase)
-    - **Persistent Failure**: Updates status to `Failed` phase with error message when:
-      - SandboxSet is deleted (immediate failure)
-      - No available sandboxes exist and pool remains empty for a significant duration (e.g., 10-30 minutes)
-      - Note: The exact timeout duration is a design decision to be made during implementation. Controller should track the first failure timestamp and transition to Failed after a configurable period (may be can add a new CRD field and status field to config and record this period ?).
+    - **Success**: All required sandboxes are claimed (ClaimedReplicas == spec.replicas, transitions to `Completed` phase)
+    - **Timeout**: If `spec.timeout` is set and exceeded, transitions to `Completed` phase regardless of claimed replicas count
+    - **Immediate Failure**: If SandboxSet is deleted, transitions to `Completed` phase immediately
+  - **Completion Behavior**: Once `Completed`, the controller stops reconciling and no longer watches claimed sandboxes
 
 **Automatic Proxy Configuration**:
 - Existing infra watches sandbox changes and automatically updates proxy routes
@@ -240,9 +253,10 @@ The claim process uses **optimistic locking** via Kubernetes resourceVersion to 
 The controller tracks claim state through phases:
 
 - **Pending**: SandboxClaim created, waiting to start claiming
-- **Claiming**: Actively claiming sandboxes or waiting for unhealthy sandboxes to recover
-- **Ready**: All required sandboxes claimed and ready
-- **Failed**: Unable to claim (no available sandboxes, timeout exceeded, etc.)
+- **Claiming**: Actively claiming sandboxes within the timeout period
+- **Completed**: Claim process finished (either all replicas claimed or timeout reached)
+
+Once a claim reaches `Completed` phase, the controller stops watching or managing the claimed sandboxes. The sandboxes remain claimed but their lifecycle is no longer managed by the SandboxClaim controller.
 
 State transitions:
 ```
@@ -252,164 +266,92 @@ State transitions:
                 │
                 ▼
          ┌──────────────┐
-    ┌───│   Claiming   │◄──┐
-    │   └──────┬───────┘   │
-    │          │            │
-    │          ▼            │
-    │   ┌──────────────┐   │
-    │   │    Ready     │───┘ (sandbox unhealthy/deleted)
-    │   └──────────────┘
-    │
-    ▼
-┌──────────────┐
-│   Failed     │
-└──────────────┘
+         │   Claiming   │
+         └──────┬───────┘
+                │
+                │ (all replicas claimed OR timeout reached)
+                ▼
+         ┌──────────────┐
+         │  Completed   │
+         └──────────────┘
 ```
 
 **Key Transitions**:
 - `Pending` → `Claiming`: Start claiming process
-- `Claiming` → `Ready`: All sandboxes claimed and ready
-- `Ready` → `Claiming`: Sandbox becomes unhealthy or deleted (automatic recovery)
-- `Claiming` ⟲ `Claiming`: Waiting for sandbox recovery or replacement
-- Any → `Failed`: Persistent errors (rare, usually stays in Claiming)
+- `Claiming` → `Completed`: 
+  - All required sandboxes claimed (ClaimedReplicas == spec.replicas), OR
+  - Timeout reached (spec.timeout exceeded)
+- Once `Completed`, the claim will not transition to any other phase
 
 **User Experience**:
 ```bash
 # Get claim status (shows counts)
 kubectl get sandboxclaim my-claim
-# NAME       PHASE   OWNER      SANDBOXSET   DESIRED   CLAIMED   READY   AGE
-# my-claim   Ready   user-123   my-pool      3         3         3       5m
+# NAME       PHASE      TEMPLATE   DESIRED   CLAIMED   AGE
+# my-claim   Completed  my-pool    3         2         5m
 
 
 ```
 
-#### Unhealthy Sandbox Handling
+#### Completion and Cleanup
 
-The controller continuously monitors claimed sandboxes and handles unhealthy/deleted cases:
+**Completion Conditions**:
+- The claim transitions to `Completed` phase when:
+  1. All required sandboxes are claimed (ClaimedReplicas == spec.replicas), OR
+  2. The timeout period (spec.timeout) is reached, OR
+  3. The SandboxSet is deleted (immediate completion)
 
-**Detection and Recovery**:
+**Post-Completion Behavior**:
+- Once `Completed`, the controller stops watching or managing the claimed sandboxes
+- The sandboxes remain claimed (with ownerReference to SandboxClaim) but their lifecycle is no longer managed
+- The `status.claimedReplicas` reflects the state at completion time
 
-1. **Deleted Sandbox**:
-    - Controller detects sandbox no longer exists (via ownerReference query)
-    - `ClaimedReplicas` decreases automatically
-    - Phase transitions from `Ready` → `Claiming`
-    - Controller claims a replacement sandbox
+**Automatic Cleanup**:
+- If `spec.ttlAfterCompleted` is set, the SandboxClaim will be automatically deleted after the specified duration once it reaches `Completed` phase
+- This helps prevent accumulation of completed claims in the cluster
+- **Important**: Only the SandboxClaim resource is deleted; the claimed sandboxes remain untouched and continue to exist independently
 
-2. **Unhealthy Sandbox**:
-    - Controller detects sandbox is not ready (Phase != Running or Ready condition false)
-    - `ReadyReplicas` decreases, `ClaimedReplicas` unchanged
-    - Phase transitions from `Ready` → `Claiming`
-    - Sandbox remains claimed (opportunity to recover)
-    - If sandbox recovers, `ReadyReplicas` increases
-
-3. **Recovery**:
-    - When all claimed sandboxes become ready
-    - Phase transitions back to `Ready`
-    - `ReadyReplicas` == `ClaimedReplicas` == `spec.replicas`
 
 #### Querying Claimed Sandboxes
 
-##### Method 1: Query SandboxClaim Status (Recommended)
+Query claimed sandboxes via Kubernetes API using labels or annotations. This approach works even after the SandboxClaim is deleted (e.g., via `ttlAfterCompleted`).
 
-The `status.sandboxes` field lists all claimed sandbox instances with routing information:
-
-```bash
-# View claim status
-kubectl get sandboxclaim test-batch -o yaml
-```
-
-Example output:
+**Step 1**: Set unique labels or annotations in SandboxClaim spec (these will be copied to claimed sandboxes):
 ```yaml
 apiVersion: agents.kruise.io/v1alpha1
 kind: SandboxClaim
 metadata:
   name: test-batch
 spec:
-  sandboxSetName: python-pool
+  templateName: python-pool
   replicas: 3
-status:
-  phase: Ready
-  claimedReplicas: 3
-  readyReplicas: 3
-  sandboxes:
-    - name: python-pool-abc123
-      sandboxID: sb-abc123
-      state: Running
-      ip: 10.244.0.10
-      claimedAt: "2025-12-30T10:00:00Z"
-    - name: python-pool-def456
-      sandboxID: sb-def456
-      state: Running
-      ip: 10.244.0.11
-      claimedAt: "2025-12-30T10:00:05Z"
-    - name: python-pool-ghi789
-      sandboxID: sb-ghi789
-      state: Running
-      ip: 10.244.0.12
-      claimedAt: "2025-12-30T10:00:10Z"
+  labels:
+    claim-id: "test-batch"  # Unique identifier for querying (recommended for label selector)
+  annotations:
+    project: "my-project"   # Additional metadata
 ```
 
-Extract sandbox IDs:
+**Step 2**: Query sandboxes via Kubernetes API:
+
+**Using Labels (Recommended)**:
 ```bash
-# Get all sandbox IDs
-kubectl get sandboxclaim test-batch -o jsonpath='{.status.sandboxes[*].sandboxID}'
-# Output: sb-abc123 sb-def456 sb-ghi789
+# Query sandboxes by label selector (most efficient)
+kubectl get sandboxes -l claim-id=test-batch
 
-# Get sandbox IDs in JSON format
-kubectl get sandboxclaim test-batch -o jsonpath='{.status.sandboxes}' | jq
+# Query with multiple labels
+kubectl get sandboxes -l claim-id=test-batch,project=my-project
 ```
 
-##### Method 2: Query via Kubernetes API (Using OwnerReference)
-
-Claimed sandboxes have the SandboxClaim set as their ownerReference:
-
+**Using Annotations**:
 ```bash
-# List all sandboxes owned by a specific claim
-kubectl get sandboxes -o json | jq '.items[] | select(.metadata.ownerReferences[]?.name == "test-batch")'
+# Using field selector (if annotations are indexed)
+kubectl get sandboxes --field-selector metadata.annotations.claim-id=test-batch
 
+# Or using jq to filter
+kubectl get sandboxes -o json | jq '.items[] | select(.metadata.annotations."claim-id" == "test-batch")'
 ```
 
-##### Method 3: Query via E2B API (Using Metadata)
 
-If the SandboxClaim sets a unique metadata annotation, sandboxes can be queried via E2B API:
-
-**Step 1**: Set unique metadata in SandboxClaim:
-```yaml
-apiVersion: agents.kruise.io/v1alpha1
-kind: SandboxClaim
-metadata:
-  name: test-batch
-spec:
-  sandboxSetName: python-pool
-  replicas: 3
-  metadata:
-    claim-id: "test-batch"  # Unique identifier for querying
-    project: "my-project"
-```
-
-**Step 2**: Query via E2B API:
-```bash
-# Query by metadata
-curl -H "X-API-KEY: $API_KEY" \
-  "https://api.example.com/v2/sandboxes?claim-id=test-batch&state=running,paused"
-```
-
-Response:
-```json
-[
-  {
-    "sandboxID": "sb-abc123",
-    "templateID": "python-pool",
-    "state": "running",
-    "metadata": {
-      "claim-id": "test-batch",
-      "project": "my-project"
-    },
-    "startedAt": "2025-12-30T10:00:00Z"
-  },
-  ...
-]
-```
 
 #### Routing to Specific Sandbox Instances
 
@@ -425,13 +367,14 @@ Upper-layer platforms can implement custom load balancing strategies:
 │  (Load Balancer)    │
 └──────────┬──────────┘
            │
-           │ 1. Query SandboxClaim status
+           │ 1. Query sandboxes via ownerReference
+           │    kubectl get sandboxes -l <selector> or
+           │    query by ownerReference to SandboxClaim
            │ 
            │
            ▼
 ┌─────────────────────────────────────┐
-│  SandboxClaim Status                │
-│  sandboxes:                         │
+│  Sandbox Resources                  │
 │  - sandboxID: sb-abc123, state: Running │
 │  - sandboxID: sb-def456, state: Running │
 │  - sandboxID: sb-ghi789, state: Running │
