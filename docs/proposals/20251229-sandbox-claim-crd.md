@@ -201,26 +201,29 @@ The SandboxClaim CRD is designed to align with the E2B HTTP API's `NewSandboxReq
 
 **Claim Process**:
 1. Track the start time when entering `Claiming` phase (for claimTimeout calculation)
-2. List available sandboxes from the specified SandboxSet (state = `available`, filtered by `IndexPoolAvailable` index)
-3. Filter candidates by checking:
+2. Calculate how many sandboxes still need to be claimed: `remaining = spec.replicas - status.claimedReplicas`
+3. List available sandboxes from the specified SandboxSet
+4. Filter candidates by checking:
    - `Status.Phase == Running` (sandbox must be running)
    - `AnnotationLock == ""` (pre-check to skip already-locked sandboxes)
-4. Randomly select a sandbox from candidates
-5. Update sandbox with:
-    - Lock annotation (UUID)
-    - Claim timestamp annotation
-    - Labels (from `claim.spec.labels`)
-    - Annotations (from `claim.spec.annotations`)
-    - Remove SandboxSet ownerReference (detach from pool)
-    - Add SandboxClaim ownerReference
-    - Set `spec.shutdownTime` (absolute time) if `shutdownTime` specified
+5. **Batch Claiming**: Attempt to claim multiple sandboxes within a single reconcile cycle:
+   - Determine batch size: `min(remaining, maxBatchSize)` where `maxBatchSize` is a configurable limit (e.g., 10)
+   - Randomly select multiple candidates (up to batch size) from the filtered list
+   - For each sandbox, update with:
+     - Lock annotation (UUID)
+     - Claim timestamp annotation
+     - Labels (from `claim.spec.labels`)
+     - Annotations (from `claim.spec.annotations`)
+     - Remove SandboxSet ownerReference (detach from pool)
+     - Add SandboxClaim ownerReference
+     - Set `spec.shutdownTime` (absolute time) if `shutdownTime` specified
 6. Inject environment variables via envd `/init` endpoint (if `claim.spec.envVars` specified)
-    - Failure to inject envVars logs error but doesn't fail the claim
-7. Check completion conditions:
-    - If `ClaimedReplicas == spec.replicas`: transition to `Completed`
-    - If `spec.claimTimeout` is set and exceeded: transition to `Completed` (regardless of claimed count)
-    - If SandboxSet is deleted: transition to `Completed` immediately
-8. If `spec.ttlAfterCompleted` is set and claim is `Completed`, schedule deletion after the TTL duration
+7. Update `status.claimedReplicas` with the actual number of successfully claimed sandboxes
+8. Check completion conditions:
+   - If `ClaimedReplicas == spec.replicas`: transition to `Completed`
+   - If `spec.claimTimeout` is set and exceeded: transition to `Completed` (regardless of claimed count)
+   - If SandboxSet is deleted: transition to `Completed` immediately
+9. If `spec.ttlAfterCompleted` is set and claim is `Completed`, schedule deletion after the TTL duration
 
 **Conflict Handling**:
 The claim process uses **optimistic locking** via Kubernetes resourceVersion to handle concurrent claims:
@@ -232,12 +235,14 @@ The claim process uses **optimistic locking** via Kubernetes resourceVersion to 
 - **Optimistic Locking**: When updating the sandbox, Kubernetes validates the resourceVersion. If the sandbox was modified by another process, the API returns a `Conflict` error.
 
 - **Declarative Retry Model**:
-  - **Per-Reconcile Attempt**: Each reconcile cycle attempts to claim one sandbox at a time
-  - **Conflict Handling**: If a `Conflict` error occurs:
-    - Logs the conflict event
-    - Updates status (remains in `Claiming` phase)
-    - Returns without error to trigger next reconcile
-    - On next reconcile, the candidate list will exclude the already-claimed sandbox
+  
+  - **Conflict Handling**:
+    - Each sandbox claim is independent and uses optimistic locking
+    - If a `Conflict` error occurs for a specific sandbox:
+      - Logs the conflict event for that sandbox
+      - Other sandboxes in the batch continue to be processed
+      - Successfully claimed sandboxes are counted in `status.claimedReplicas`
+    - Partial success is acceptable: the controller tracks `claimedReplicas` and continues claiming remaining sandboxes
   - **Continuous Reconciliation**: Controller keeps reconciling until:
     - **Success**: All required sandboxes are claimed (ClaimedReplicas == spec.replicas, transitions to `Completed` phase)
     - **Timeout**: If `spec.claimTimeout` is set and exceeded, transitions to `Completed` phase regardless of claimed replicas count
