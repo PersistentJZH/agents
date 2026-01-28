@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
+	"github.com/openkruise/agents/pkg/webhook/sandboxclaim"
 	"github.com/openkruise/agents/pkg/webhook/sandboxset"
 	"github.com/openkruise/agents/pkg/webhook/types"
 	"k8s.io/client-go/rest"
@@ -26,6 +27,7 @@ var (
 
 func init() {
 	HandlerGetters = append(HandlerGetters, sandboxset.GetHandlerGetters()...)
+	HandlerGetters = append(HandlerGetters, sandboxclaim.GetHandlerGetters()...)
 }
 
 // +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch;create;update;patch;delete,namespace=sandbox-system
