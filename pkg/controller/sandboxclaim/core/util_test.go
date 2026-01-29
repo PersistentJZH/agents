@@ -253,11 +253,12 @@ func TestCalculateClaimStatus(t *testing.T) {
 	pastTime := metav1.NewTime(now.Add(-10 * time.Second))
 
 	tests := []struct {
-		name              string
-		args              ClaimArgs
-		expectedPhase     agentsv1alpha1.SandboxClaimPhase
-		shouldRequeue     bool
-		checkCompletedSet bool // Whether CompletionTime should be set
+		name               string
+		args               ClaimArgs
+		expectedPhase      agentsv1alpha1.SandboxClaimPhase
+		shouldRequeue      bool
+		checkCompletedSet  bool // Whether CompletionTime should be set
+		checkStartTimeSet  bool // Whether ClaimStartTime should be set
 	}{
 		{
 			name: "initialize new claim",
@@ -273,8 +274,9 @@ func TestCalculateClaimStatus(t *testing.T) {
 				SandboxSet: &agentsv1alpha1.SandboxSet{},
 				NewStatus:  &agentsv1alpha1.SandboxClaimStatus{},
 			},
-			expectedPhase: agentsv1alpha1.SandboxClaimPhasePending,
-			shouldRequeue: false,
+			expectedPhase:     agentsv1alpha1.SandboxClaimPhaseClaiming,
+			shouldRequeue:     false,
+			checkStartTimeSet: true, // ClaimStartTime should be set when initializing
 		},
 		{
 			name: "already completed",
@@ -396,6 +398,10 @@ func TestCalculateClaimStatus(t *testing.T) {
 
 			if tt.checkCompletedSet && gotStatus.CompletionTime == nil {
 				t.Errorf("CalculateClaimStatus() CompletionTime should be set but is nil")
+			}
+
+			if tt.checkStartTimeSet && gotStatus.ClaimStartTime == nil {
+				t.Errorf("CalculateClaimStatus() ClaimStartTime should be set but is nil")
 			}
 
 			// Check ObservedGeneration is updated

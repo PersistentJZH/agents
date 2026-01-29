@@ -22,7 +22,10 @@ import (
 	"time"
 
 	agentsv1alpha1 "github.com/openkruise/agents/api/v1alpha1"
+	clientsetfake "github.com/openkruise/agents/client/clientset/versioned/fake"
+	informers "github.com/openkruise/agents/client/informers/externalversions"
 	"github.com/openkruise/agents/pkg/controller/sandboxclaim/core"
+	"github.com/openkruise/agents/pkg/sandbox-manager/infra/sandboxcr"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -53,28 +56,6 @@ func TestReconciler_Reconcile_BasicFlow(t *testing.T) {
 			expectedPhase: "",
 			wantErr:       false,
 			wantRequeue:   false,
-		},
-		{
-			name: "new claim - pending phase",
-			claim: &agentsv1alpha1.SandboxClaim{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:       "test-claim",
-					Namespace:  "default",
-					Generation: 1,
-				},
-				Spec: agentsv1alpha1.SandboxClaimSpec{
-					TemplateName: "test-sandboxset",
-				},
-			},
-			sandboxSet: &agentsv1alpha1.SandboxSet{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "test-sandboxset",
-					Namespace: "default",
-				},
-			},
-			expectedPhase: agentsv1alpha1.SandboxClaimPhaseClaiming,
-			wantErr:       false,
-			wantRequeue:   true, // EnsureClaimPending returns RequeueImmediately
 		},
 		{
 			name: "sandboxset not found",
@@ -123,7 +104,7 @@ func TestReconciler_Reconcile_BasicFlow(t *testing.T) {
 				Client:   fakeClient,
 				Scheme:   scheme,
 				controls: core.NewClaimControl(fakeClient, fakeRecorder, nil, nil),
-			recorder: fakeRecorder,
+				recorder: fakeRecorder,
 			}
 
 			req := reconcile.Request{
@@ -167,6 +148,25 @@ func TestReconciler_Reconcile_Claiming(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = agentsv1alpha1.AddToScheme(scheme)
 
+	// Initialize cache and sandboxClient
+	sandboxClient := clientsetfake.NewSimpleClientset()
+	sandboxInformerFactory := informers.NewSharedInformerFactory(sandboxClient, time.Minute*10)
+	sandboxInformer := sandboxInformerFactory.Api().V1alpha1().Sandboxes().Informer()
+	sandboxSetInformer := sandboxInformerFactory.Api().V1alpha1().SandboxSets().Informer()
+
+	cache, err := sandboxcr.NewCache(sandboxInformerFactory, sandboxInformer, sandboxSetInformer, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("Failed to create cache: %v", err)
+	}
+
+	// Start cache
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		_ = cache.Run(ctx)
+	}()
+	time.Sleep(200 * time.Millisecond) // Wait for cache to start
+
 	claim := &agentsv1alpha1.SandboxClaim{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:       "test-claim",
@@ -207,6 +207,17 @@ func TestReconciler_Reconcile_Claiming(t *testing.T) {
 		},
 	}
 
+	// Pre-create sandboxes in sandboxClient (for cache)
+	_, err = sandboxClient.ApiV1alpha1().Sandboxes(sandbox1.Namespace).Create(ctx, sandbox1, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("Failed to create sandbox1 in sandboxClient: %v", err)
+	}
+	_, err = sandboxClient.ApiV1alpha1().Sandboxes(sandbox2.Namespace).Create(ctx, sandbox2, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("Failed to create sandbox2 in sandboxClient: %v", err)
+	}
+	time.Sleep(100 * time.Millisecond) // Wait for cache sync
+
 	fakeClient := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithObjects(claim, sandboxSet, sandbox1, sandbox2).
@@ -218,7 +229,7 @@ func TestReconciler_Reconcile_Claiming(t *testing.T) {
 	reconciler := &Reconciler{
 		Client:   fakeClient,
 		Scheme:   scheme,
-		controls: core.NewClaimControl(fakeClient, fakeRecorder, nil, nil),
+		controls: core.NewClaimControl(fakeClient, fakeRecorder, sandboxClient, cache),
 		recorder: fakeRecorder,
 	}
 
@@ -230,7 +241,7 @@ func TestReconciler_Reconcile_Claiming(t *testing.T) {
 	}
 
 	// First reconcile - should transition to Claiming
-	_, err := reconciler.Reconcile(context.Background(), req)
+	_, err = reconciler.Reconcile(context.Background(), req)
 	if err != nil {
 		t.Fatalf("First Reconcile() error = %v", err)
 	}

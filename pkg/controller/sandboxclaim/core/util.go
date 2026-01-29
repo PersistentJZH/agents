@@ -36,7 +36,7 @@ import (
 //   - skipBusinessLogic: true if should skip Ensure* methods and go directly to status update
 //
 // Handled scenarios (in order):
-//  1. New claim (Phase == "")               → Pending, continue
+//  1. New claim (Phase == "")               → Claiming, continue
 //  2. Already Completed                     → Completed, continue (for TTL cleanup)
 //  3. SandboxSet not found                  → Completed, SKIP (terminal)
 //  4. Timeout exceeded                      → Completed, SKIP (terminal)
@@ -51,13 +51,15 @@ func CalculateClaimStatus(args ClaimArgs) (*agentsv1alpha1.SandboxClaimStatus, b
 	// Always update ObservedGeneration to track spec changes
 	newStatus.ObservedGeneration = claim.Generation
 
-	// 1. Handle initial state
+	// 1. Handle initial state - directly transition to Claiming phase
 	if newStatus.Phase == "" {
-		klog.InfoS("Initializing new SandboxClaim",
+		klog.InfoS("Initializing new SandboxClaim, starting claim process",
 			"claim", klog.KObj(claim),
 			"generation", claim.Generation,
 			"desiredReplicas", getDesiredReplicas(claim))
-		newStatus.Phase = agentsv1alpha1.SandboxClaimPhasePending
+		newStatus.Phase = agentsv1alpha1.SandboxClaimPhaseClaiming
+		now := metav1.Now()
+		newStatus.ClaimStartTime = &now
 		return newStatus, false
 	}
 

@@ -28,10 +28,11 @@ type SandboxClaimSpec struct {
 
 	// Replicas specifies how many sandboxes to claim (default: 1)
 	// For batch claiming support
-	// This field is immutable once set (enforced by webhook)
+	// This field is immutable once set
 	// +optional
 	// +kubebuilder:default=1
 	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="replicas is immutable"
 	Replicas *int32 `json:"replicas,omitempty"`
 
 	// ShutdownTime specifies the absolute time when the sandbox should be shut down
@@ -75,7 +76,6 @@ type SandboxClaimStatus struct {
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 
 	// Phase represents the current phase of the claim
-	// Pending: Waiting to start claiming
 	// Claiming: In the process of claiming sandboxes
 	// Completed: Claim process finished (either all replicas claimed or timeout reached)
 	// +optional
@@ -113,7 +113,6 @@ type SandboxClaimStatus struct {
 type SandboxClaimPhase string
 
 const (
-	SandboxClaimPhasePending   SandboxClaimPhase = "Pending"
 	SandboxClaimPhaseClaiming  SandboxClaimPhase = "Claiming"
 	SandboxClaimPhaseCompleted SandboxClaimPhase = "Completed"
 )

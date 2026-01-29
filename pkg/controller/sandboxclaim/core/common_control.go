@@ -23,7 +23,6 @@ import (
 	"sync"
 	"time"
 
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -59,22 +58,6 @@ func NewCommonControl(c client.Client, recorder record.EventRecorder, sandboxCli
 	return control
 }
 
-// EnsureClaimPending handles initialization for a new claim in Pending phase.
-// Returns RequeueStrategy for immediate transition to Claiming phase
-func (c *commonControl) EnsureClaimPending(ctx context.Context, args ClaimArgs) (RequeueStrategy, error) {
-	log := logf.FromContext(ctx)
-
-	// Transition to Claiming phase and record start time
-	args.NewStatus.Phase = agentsv1alpha1.SandboxClaimPhaseClaiming
-	now := metav1.Now()
-	args.NewStatus.ClaimStartTime = &now
-
-	log.Info("Starting claim process, transitioning from Pending to Claiming phase")
-
-	// Requeue immediately to start claiming
-	return RequeueImmediately(), nil
-}
-
 // EnsureClaimClaiming handles the logic for claiming sandboxes
 func (c *commonControl) EnsureClaimClaiming(ctx context.Context, args ClaimArgs) (RequeueStrategy, error) {
 	log := logf.FromContext(ctx)
@@ -90,6 +73,13 @@ func (c *commonControl) EnsureClaimClaiming(ctx context.Context, args ClaimArgs)
 	// This handles edge cases:
 	// - Controller crashes after claiming but before status update
 	// - Status update fails due to network issues
+	// TODO: Known edge case - if the following sequence happens:
+	//   1. Sandboxes are successfully claimed
+	//   2. Controller crashes before status update
+	//   3. User manually deletes some claimed sandboxes
+	//   4. Controller restarts
+	//   Then the controller will create new sandboxes to reach the desired replicas,
+	//   even though the user intentionally deleted them, it's an extremely rare case.
 	actualCount, err := c.countClaimedSandboxes(ctx, claim)
 	if err != nil {
 		return NoRequeue(), fmt.Errorf("failed to count claimed sandboxes: %w", err)
@@ -234,33 +224,32 @@ func (c *commonControl) claimSandboxes(ctx context.Context, claim *agentsv1alpha
 // buildClaimOptions constructs ClaimSandboxOptions for TryClaimSandbox
 func (c *commonControl) buildClaimOptions(ctx context.Context, claim *agentsv1alpha1.SandboxClaim, sandboxSet *agentsv1alpha1.SandboxSet) (infra.ClaimSandboxOptions, error) {
 	opts := infra.ClaimSandboxOptions{
-		User:     client.ObjectKeyFromObject(claim).String(),
+		User:     string(claim.UID), // Use UID to ensure uniqueness across claim recreations
 		Template: sandboxSet.Name,
 		Modifier: func(sbx infra.Sandbox) {
-
 			// 1. apply labels
 			labels := sbx.GetLabels()
 			if labels == nil {
 				labels = make(map[string]string)
 			}
-			// Set UID for uniqueness (prevents conflict when claim is recreated with same name)
-			labels[agentsv1alpha1.LabelSandboxClaimedBy] = string(claim.UID)
-			// Set name for readability
-			labels[agentsv1alpha1.LabelSandboxClaimedByName] = claim.Name
+			labels[agentsv1alpha1.LabelSandboxClaimName] = claim.Name
+
 			for k, v := range claim.Spec.Labels {
 				labels[k] = v
 			}
 			sbx.SetLabels(labels)
 
 			// 2. apply annotations
-			annotations := sbx.GetAnnotations()
-			if annotations == nil {
-				annotations = make(map[string]string)
+			if len(claim.Spec.Annotations) > 0 {
+				annotations := sbx.GetAnnotations()
+				if annotations == nil {
+					annotations = make(map[string]string)
+				}
+				for k, v := range claim.Spec.Annotations {
+					annotations[k] = v
+				}
+				sbx.SetAnnotations(annotations)
 			}
-			for k, v := range claim.Spec.Annotations {
-				annotations[k] = v
-			}
-			sbx.SetAnnotations(annotations)
 
 			// 3. apply shutdownTime
 			if claim.Spec.ShutdownTime != nil {
@@ -279,19 +268,12 @@ func (c *commonControl) buildClaimOptions(ctx context.Context, claim *agentsv1al
 
 // countClaimedSandboxes counts sandboxes that are claimed by this claim
 func (c *commonControl) countClaimedSandboxes(ctx context.Context, claim *agentsv1alpha1.SandboxClaim) (int32, error) {
-	sandboxList := &agentsv1alpha1.SandboxList{}
-	listOpts := []client.ListOption{
-		client.InNamespace(claim.Namespace),
-		client.MatchingLabels{
-			agentsv1alpha1.LabelSandboxClaimedBy: string(claim.UID),
-		},
-	}
-
-	if err := c.List(ctx, sandboxList, listOpts...); err != nil {
+	sandboxes, err := c.cache.ListSandboxWithUser(string(claim.UID))
+	if err != nil {
 		return 0, err
 	}
 
-	return int32(len(sandboxList.Items)), nil
+	return int32(len(sandboxes)), nil
 }
 
 func min(a, b int) int {
@@ -300,5 +282,3 @@ func min(a, b int) int {
 	}
 	return b
 }
-
-// setCondition sets or updates a condition in the conditions slice

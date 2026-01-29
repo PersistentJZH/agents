@@ -90,10 +90,13 @@ spec:
                 description: |-
                   Replicas specifies how many sandboxes to claim (default: 1)
                   For batch claiming support
-                  This field is immutable once set (enforced by webhook)
+                  This field is immutable once set
                 format: int32
                 minimum: 1
                 type: integer
+                x-kubernetes-validations:
+                - message: replicas is immutable
+                  rule: self == oldSelf
               shutdownTime:
                 description: |-
                   ShutdownTime specifies the absolute time when the sandbox should be shut down
@@ -206,7 +209,6 @@ spec:
               phase:
                 description: |-
                   Phase represents the current phase of the claim
-                  Pending: Waiting to start claiming
                   Claiming: In the process of claiming sandboxes
                   Completed: Claim process finished (either all replicas claimed or timeout reached)
                 type: string

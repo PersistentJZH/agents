@@ -38,27 +38,6 @@ webhooks:
     service:
       name: webhook-service
       namespace: system
-      path: /validate-sandboxclaim
-  failurePolicy: Fail
-  name: vsandboxclaim.kb.io
-  rules:
-  - apiGroups:
-    - agents.kruise.io
-    apiVersions:
-    - v1alpha1
-    operations:
-    - CREATE
-    - UPDATE
-    resources:
-    - sandboxclaims
-  sideEffects: None
-- admissionReviewVersions:
-  - v1
-  - v1beta1
-  clientConfig:
-    service:
-      name: webhook-service
-      namespace: system
       path: /validate-sandboxset
   failurePolicy: Fail
   name: v-sbs.kb.io

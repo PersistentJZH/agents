@@ -68,9 +68,6 @@ type ClaimArgs struct {
 
 // ClaimControl defines the interface for claiming operations
 type ClaimControl interface {
-	// EnsureClaimPending handles claim in Pending phase
-	EnsureClaimPending(ctx context.Context, args ClaimArgs) (RequeueStrategy, error)
-
 	// EnsureClaimClaiming handles claim in Claiming phase
 	EnsureClaimClaiming(ctx context.Context, args ClaimArgs) (RequeueStrategy, error)
 

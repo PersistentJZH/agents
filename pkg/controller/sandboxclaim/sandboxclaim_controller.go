@@ -87,10 +87,11 @@ func Add(mgr manager.Manager) error {
 
 	coreInformerFactory := k8sinformers.NewSharedInformerFactory(k8sClientset, time.Minute*10)
 	persistentVolumeInformer := coreInformerFactory.Core().V1().PersistentVolumes().Informer()
-	secretInformer := coreInformerFactory.Core().V1().Secrets().Informer()
+	coreInformerFactorySpecifiedNs := k8sinformers.NewSharedInformerFactoryWithOptions(k8sClientset, time.Minute*10, k8sinformers.WithNamespace(utils.DefaultSandboxDeployNamespace))
+	secretInformer := coreInformerFactorySpecifiedNs.Core().V1().Secrets().Informer()
 
 	// Initialize cache
-	cache, err := sandboxcr.NewCache(informerFactory, sandboxInformer, sandboxSetInformer, coreInformerFactory, persistentVolumeInformer, secretInformer)
+	cache, err := sandboxcr.NewCache(informerFactory, sandboxInformer, sandboxSetInformer, coreInformerFactorySpecifiedNs, secretInformer, coreInformerFactory, persistentVolumeInformer)
 	if err != nil {
 		return fmt.Errorf("failed to create cache: %w", err)
 	}
@@ -195,9 +196,6 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 
 	// State-driven execution - each Ensure method returns its own requeue strategy
 	switch newStatus.Phase {
-	case agentsv1alpha1.SandboxClaimPhasePending:
-		strategy, err = r.getControl().EnsureClaimPending(ctx, args)
-
 	case agentsv1alpha1.SandboxClaimPhaseClaiming:
 		strategy, err = r.getControl().EnsureClaimClaiming(ctx, args)
 

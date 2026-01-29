@@ -38,6 +38,26 @@ var _ = Describe("SandboxClaim", func() {
 		namespace string
 	)
 
+	// Helper function to list sandboxes claimed by a specific SandboxClaim
+	// Uses AnnotationOwner (which stores the claim's UID) for filtering
+	listClaimedSandboxes := func(ctx context.Context, claim *agentsv1alpha1.SandboxClaim) ([]agentsv1alpha1.Sandbox, error) {
+		sandboxList := &agentsv1alpha1.SandboxList{}
+		if err := k8sClient.List(ctx, sandboxList, client.InNamespace(claim.Namespace)); err != nil {
+			return nil, err
+		}
+
+		// AnnotationOwner is set to the claim's UID for uniqueness
+		expectedOwner := string(claim.UID)
+		claimed := []agentsv1alpha1.Sandbox{}
+		for _, sandbox := range sandboxList.Items {
+			if sandbox.Annotations != nil &&
+				sandbox.Annotations[agentsv1alpha1.AnnotationOwner] == expectedOwner {
+				claimed = append(claimed, sandbox)
+			}
+		}
+		return claimed, nil
+	}
+
 	BeforeEach(func() {
 		namespace = createNamespace(ctx)
 	})
@@ -130,15 +150,9 @@ var _ = Describe("SandboxClaim", func() {
 			Expect(sandboxClaim.Status.CompletionTime).NotTo(BeNil())
 
 			By("Verifying at least one sandbox is claimed by the claim")
-			sandboxList := &agentsv1alpha1.SandboxList{}
-			Expect(k8sClient.List(ctx, sandboxList,
-				client.InNamespace(namespace),
-				client.MatchingLabels{
-					agentsv1alpha1.LabelSandboxClaimedBy: string(sandboxClaim.UID),
-				},
-			)).To(Succeed())
-
-			Expect(sandboxList.Items).To(HaveLen(1))
+			claimedSandboxes, err := listClaimedSandboxes(ctx, sandboxClaim)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(claimedSandboxes).To(HaveLen(1))
 		})
 
 		It("should successfully claim multiple sandboxes", func() {
@@ -168,15 +182,9 @@ var _ = Describe("SandboxClaim", func() {
 			Expect(sandboxClaim.Status.ClaimedReplicas).To(Equal(int32(3)))
 
 			By("Verifying exactly 3 sandboxes are claimed by the claim")
-			sandboxList := &agentsv1alpha1.SandboxList{}
-			Expect(k8sClient.List(ctx, sandboxList,
-				client.InNamespace(namespace),
-				client.MatchingLabels{
-					agentsv1alpha1.LabelSandboxClaimedBy: string(sandboxClaim.UID),
-				},
-			)).To(Succeed())
-
-			Expect(sandboxList.Items).To(HaveLen(3))
+			claimedSandboxes, err := listClaimedSandboxes(ctx, sandboxClaim)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(claimedSandboxes).To(HaveLen(3))
 		})
 
 		It("should show progress during claiming", func() {
@@ -193,7 +201,7 @@ var _ = Describe("SandboxClaim", func() {
 			}
 			Expect(k8sClient.Create(ctx, sandboxClaim)).To(Succeed())
 
-			By("Verifying the claim phase is valid (Pending, Claiming, or Completed)")
+			By("Verifying the claim phase is valid (Claiming or Completed)")
 			Eventually(func() bool {
 				_ = k8sClient.Get(ctx, types.NamespacedName{
 					Name:      sandboxClaim.Name,
@@ -201,8 +209,7 @@ var _ = Describe("SandboxClaim", func() {
 				}, sandboxClaim)
 				phase := sandboxClaim.Status.Phase
 				// Accept any valid phase - if Controller is fast, it might already be Completed
-				return phase == agentsv1alpha1.SandboxClaimPhasePending ||
-					phase == agentsv1alpha1.SandboxClaimPhaseClaiming ||
+				return phase == agentsv1alpha1.SandboxClaimPhaseClaiming ||
 					phase == agentsv1alpha1.SandboxClaimPhaseCompleted
 			}, time.Second*10, time.Millisecond*500).Should(BeTrue())
 
@@ -679,16 +686,9 @@ var _ = Describe("SandboxClaim", func() {
 			}, time.Minute, time.Second).Should(Equal(agentsv1alpha1.SandboxClaimPhaseCompleted))
 
 			By("Counting sandboxes claimed by this claim")
-			var claimedSandboxCount int
-			sandboxList := &agentsv1alpha1.SandboxList{}
-			Expect(k8sClient.List(ctx, sandboxList, client.InNamespace(namespace))).To(Succeed())
-			for _, sandbox := range sandboxList.Items {
-				// Check label to find claimed sandboxes (using UID for uniqueness)
-				if sandbox.Labels[agentsv1alpha1.LabelSandboxClaimedBy] == string(sandboxClaim.UID) {
-					claimedSandboxCount++
-				}
-			}
-			Expect(claimedSandboxCount).To(Equal(2))
+			claimedSandboxes, err := listClaimedSandboxes(ctx, sandboxClaim)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(claimedSandboxes).To(HaveLen(2))
 
 			By("Deleting the claim")
 			Expect(k8sClient.Delete(ctx, sandboxClaim)).To(Succeed())
@@ -704,15 +704,15 @@ var _ = Describe("SandboxClaim", func() {
 
 			By("Verifying sandboxes still exist (not cascade deleted)")
 			// Sandboxes should NOT be deleted when claim is deleted
-			// We use labels instead of ownerReferences for tracking
-			sandboxList = &agentsv1alpha1.SandboxList{}
+			// We use annotations instead of ownerReferences for tracking
+			sandboxList := &agentsv1alpha1.SandboxList{}
 			Expect(k8sClient.List(ctx, sandboxList, client.InNamespace(namespace))).To(Succeed())
 
 			stillExistCount := 0
 			claimUID := string(sandboxClaim.UID)
 			for _, sandbox := range sandboxList.Items {
-				// Check if sandbox was claimed by this claim (label may still exist)
-				if sandbox.Labels[agentsv1alpha1.LabelSandboxClaimedBy] == claimUID {
+				// Check if sandbox was claimed by this claim (annotation may still exist)
+				if sandbox.Annotations != nil && sandbox.Annotations[agentsv1alpha1.AnnotationOwner] == claimUID {
 					stillExistCount++
 				}
 			}
@@ -1011,14 +1011,9 @@ var _ = Describe("SandboxClaim", func() {
 			}, time.Second*30, time.Second).Should(Equal(int32(3)))
 
 			By("Verifying no duplicate claiming occurred")
-			sandboxList := &agentsv1alpha1.SandboxList{}
-			Expect(k8sClient.List(ctx, sandboxList,
-				client.InNamespace(namespace),
-				client.MatchingLabels{
-					agentsv1alpha1.LabelSandboxClaimedBy: string(sandboxClaim.UID),
-				},
-			)).To(Succeed())
-			Expect(sandboxList.Items).To(HaveLen(3), "Should still have exactly 3 claimed sandboxes")
+			claimedSandboxes, err := listClaimedSandboxes(ctx, sandboxClaim)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(claimedSandboxes).To(HaveLen(3), "Should still have exactly 3 claimed sandboxes")
 
 			By("Verifying claim transitions back to Completed")
 			Eventually(func() agentsv1alpha1.SandboxClaimPhase {
@@ -1054,17 +1049,12 @@ var _ = Describe("SandboxClaim", func() {
 			}, time.Minute, time.Second).Should(Equal(agentsv1alpha1.SandboxClaimPhaseCompleted))
 
 			By("Getting the list of claimed sandboxes")
-			sandboxList := &agentsv1alpha1.SandboxList{}
-			Expect(k8sClient.List(ctx, sandboxList,
-				client.InNamespace(namespace),
-				client.MatchingLabels{
-					agentsv1alpha1.LabelSandboxClaimedBy: string(sandboxClaim.UID),
-				},
-			)).To(Succeed())
-			Expect(sandboxList.Items).To(HaveLen(3))
+			claimedSandboxes, err := listClaimedSandboxes(ctx, sandboxClaim)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(claimedSandboxes).To(HaveLen(3))
 
 			By("Manually deleting one claimed sandbox (simulating user action)")
-			deletedSandbox := &sandboxList.Items[0]
+			deletedSandbox := &claimedSandboxes[0]
 			Expect(k8sClient.Delete(ctx, deletedSandbox)).To(Succeed())
 
 			By("Waiting for sandbox to be deleted")
@@ -1103,13 +1093,9 @@ var _ = Describe("SandboxClaim", func() {
 			}, time.Second*20, time.Second*2).Should(Equal(int32(3)))
 
 			By("Verifying only 2 sandboxes exist (one was deleted)")
-			Expect(k8sClient.List(ctx, sandboxList,
-				client.InNamespace(namespace),
-				client.MatchingLabels{
-					agentsv1alpha1.LabelSandboxClaimedBy: string(sandboxClaim.UID),
-				},
-			)).To(Succeed())
-			Expect(sandboxList.Items).To(HaveLen(2), "Should have 2 sandboxes after manual deletion")
+			claimedSandboxes, err = listClaimedSandboxes(ctx, sandboxClaim)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(claimedSandboxes).To(HaveLen(2), "Should have 2 sandboxes after manual deletion")
 
 			By("Verifying claim remains Completed (no attempt to claim more)")
 			Expect(sandboxClaim.Status.Phase).To(Equal(agentsv1alpha1.SandboxClaimPhaseCompleted))
@@ -1140,14 +1126,9 @@ var _ = Describe("SandboxClaim", func() {
 
 			By("Recording actual claimed count before status reset")
 			var actualClaimedBeforeReset int32
-			sandboxList := &agentsv1alpha1.SandboxList{}
-			Expect(k8sClient.List(ctx, sandboxList,
-				client.InNamespace(namespace),
-				client.MatchingLabels{
-					agentsv1alpha1.LabelSandboxClaimedBy: string(sandboxClaim.UID),
-				},
-			)).To(Succeed())
-			actualClaimedBeforeReset = int32(len(sandboxList.Items))
+			claimedSandboxes, err := listClaimedSandboxes(ctx, sandboxClaim)
+			Expect(err).NotTo(HaveOccurred())
+			actualClaimedBeforeReset = int32(len(claimedSandboxes))
 
 			By("Simulating complete status loss - resetting ClaimedReplicas to 0")
 			Eventually(func() error {
@@ -1187,13 +1168,9 @@ var _ = Describe("SandboxClaim", func() {
 			}, time.Minute, time.Second).Should(BeTrue())
 
 			By("Verifying exactly 5 sandboxes were claimed (no duplicates)")
-			Expect(k8sClient.List(ctx, sandboxList,
-				client.InNamespace(namespace),
-				client.MatchingLabels{
-					agentsv1alpha1.LabelSandboxClaimedBy: string(sandboxClaim.UID),
-				},
-			)).To(Succeed())
-			Expect(sandboxList.Items).To(HaveLen(5), "Should have exactly 5 claimed sandboxes")
+			claimedSandboxes, err = listClaimedSandboxes(ctx, sandboxClaim)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(claimedSandboxes).To(HaveLen(5), "Should have exactly 5 claimed sandboxes")
 		})
 
 		Context("Labels and Annotations", func() {
@@ -1280,26 +1257,20 @@ var _ = Describe("SandboxClaim", func() {
 				}, time.Minute, time.Second).Should(Equal(agentsv1alpha1.SandboxClaimPhaseCompleted))
 
 				By("Verifying custom labels are set on claimed sandboxes")
-				sandboxList := &agentsv1alpha1.SandboxList{}
-				Expect(k8sClient.List(ctx, sandboxList,
-					client.InNamespace(namespace),
-					client.MatchingLabels{
-						agentsv1alpha1.LabelSandboxClaimedBy: string(sandboxClaim.UID),
-					},
-				)).To(Succeed())
+				claimedSandboxes, err := listClaimedSandboxes(ctx, sandboxClaim)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(claimedSandboxes).To(HaveLen(2), "Should have 2 claimed sandboxes")
 
-				Expect(sandboxList.Items).To(HaveLen(2), "Should have 2 claimed sandboxes")
-
-				for _, sandbox := range sandboxList.Items {
-					// Verify system label (UID)
-					Expect(sandbox.Labels).To(HaveKeyWithValue(
-						agentsv1alpha1.LabelSandboxClaimedBy,
+				for _, sandbox := range claimedSandboxes {
+					// Verify system annotation (UID for uniqueness)
+					Expect(sandbox.Annotations).To(HaveKeyWithValue(
+						agentsv1alpha1.AnnotationOwner,
 						string(sandboxClaim.UID),
-					), "System label (UID) should be set")
+					), "System annotation (UID) should be set")
 
-					// Verify system label (Name for readability)
+					// Verify system label (Name for readability/display)
 					Expect(sandbox.Labels).To(HaveKeyWithValue(
-						agentsv1alpha1.LabelSandboxClaimedByName,
+						agentsv1alpha1.LabelSandboxClaimName,
 						sandboxClaim.Name,
 					), "System label (Name) should be set")
 
@@ -1344,17 +1315,11 @@ var _ = Describe("SandboxClaim", func() {
 				}, time.Minute, time.Second).Should(Equal(agentsv1alpha1.SandboxClaimPhaseCompleted))
 
 				By("Verifying custom annotations are set on claimed sandboxes")
-				sandboxList := &agentsv1alpha1.SandboxList{}
-				Expect(k8sClient.List(ctx, sandboxList,
-					client.InNamespace(namespace),
-					client.MatchingLabels{
-						agentsv1alpha1.LabelSandboxClaimedBy: string(sandboxClaim.UID),
-					},
-				)).To(Succeed())
+				claimedSandboxes, err := listClaimedSandboxes(ctx, sandboxClaim)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(claimedSandboxes).To(HaveLen(2), "Should have 2 claimed sandboxes")
 
-				Expect(sandboxList.Items).To(HaveLen(2), "Should have 2 claimed sandboxes")
-
-				for _, sandbox := range sandboxList.Items {
+				for _, sandbox := range claimedSandboxes {
 					// Verify all custom annotations
 					Expect(sandbox.Annotations).To(HaveKeyWithValue("custom-annotation-1", "annotation-value1"))
 					Expect(sandbox.Annotations).To(HaveKeyWithValue("custom-annotation-2", "annotation-value2"))
@@ -1398,25 +1363,20 @@ var _ = Describe("SandboxClaim", func() {
 				}, time.Minute, time.Second).Should(Equal(agentsv1alpha1.SandboxClaimPhaseCompleted))
 
 				By("Verifying both labels and annotations are set")
-				sandboxList := &agentsv1alpha1.SandboxList{}
-				Expect(k8sClient.List(ctx, sandboxList,
-					client.InNamespace(namespace),
-					client.MatchingLabels{
-						agentsv1alpha1.LabelSandboxClaimedBy: string(sandboxClaim.UID),
-					},
-				)).To(Succeed())
+				claimedSandboxes, err := listClaimedSandboxes(ctx, sandboxClaim)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(claimedSandboxes).To(HaveLen(1), "Should have 1 claimed sandbox")
 
-				Expect(sandboxList.Items).To(HaveLen(1), "Should have 1 claimed sandbox")
+				sandbox := claimedSandboxes[0]
 
-				sandbox := sandboxList.Items[0]
-
-				// Verify system labels
-				Expect(sandbox.Labels).To(HaveKeyWithValue(
-					agentsv1alpha1.LabelSandboxClaimedBy,
+				// Verify system annotation (UID for uniqueness)
+				Expect(sandbox.Annotations).To(HaveKeyWithValue(
+					agentsv1alpha1.AnnotationOwner,
 					string(sandboxClaim.UID),
 				))
+				// Verify system label (Name for display)
 				Expect(sandbox.Labels).To(HaveKeyWithValue(
-					agentsv1alpha1.LabelSandboxClaimedByName,
+					agentsv1alpha1.LabelSandboxClaimName,
 					sandboxClaim.Name,
 				))
 
@@ -1462,17 +1422,12 @@ var _ = Describe("SandboxClaim", func() {
 				By("Recording first claim's UID and sandboxes")
 				firstClaimUID := string(sandboxClaim.UID)
 
-				sandboxList := &agentsv1alpha1.SandboxList{}
-				Expect(k8sClient.List(ctx, sandboxList,
-					client.InNamespace(namespace),
-					client.MatchingLabels{
-						agentsv1alpha1.LabelSandboxClaimedBy: firstClaimUID,
-					},
-				)).To(Succeed())
-				Expect(sandboxList.Items).To(HaveLen(2), "First claim should have 2 sandboxes")
+				firstClaimSandboxes, err := listClaimedSandboxes(ctx, sandboxClaim)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(firstClaimSandboxes).To(HaveLen(2), "First claim should have 2 sandboxes")
 
 				firstClaimSandboxNames := make([]string, 0, 2)
-				for _, sandbox := range sandboxList.Items {
+				for _, sandbox := range firstClaimSandboxes {
 					firstClaimSandboxNames = append(firstClaimSandboxNames, sandbox.Name)
 					// Verify first generation label
 					Expect(sandbox.Labels).To(HaveKeyWithValue("generation", "first"))
@@ -1491,14 +1446,16 @@ var _ = Describe("SandboxClaim", func() {
 				}, time.Second*10, time.Second).Should(BeTrue())
 
 				By("Verifying first claim's sandboxes still exist (not cascade deleted)")
-				sandboxList = &agentsv1alpha1.SandboxList{}
-				Expect(k8sClient.List(ctx, sandboxList,
-					client.InNamespace(namespace),
-					client.MatchingLabels{
-						agentsv1alpha1.LabelSandboxClaimedBy: firstClaimUID,
-					},
-				)).To(Succeed())
-				Expect(sandboxList.Items).To(HaveLen(2), "Old sandboxes should still exist")
+				sandboxList := &agentsv1alpha1.SandboxList{}
+				Expect(k8sClient.List(ctx, sandboxList, client.InNamespace(namespace))).To(Succeed())
+
+				stillExistCount := 0
+				for _, sandbox := range sandboxList.Items {
+					if sandbox.Annotations != nil && sandbox.Annotations[agentsv1alpha1.AnnotationOwner] == firstClaimUID {
+						stillExistCount++
+					}
+				}
+				Expect(stillExistCount).To(Equal(2), "Old sandboxes should still exist")
 
 				By("Creating a new claim with the SAME name but different spec")
 				sandboxClaim = &agentsv1alpha1.SandboxClaim{
@@ -1532,26 +1489,23 @@ var _ = Describe("SandboxClaim", func() {
 				secondClaimUID := string(sandboxClaim.UID)
 				Expect(secondClaimUID).NotTo(Equal(firstClaimUID), "New claim should have different UID")
 
-				sandboxList = &agentsv1alpha1.SandboxList{}
-				Expect(k8sClient.List(ctx, sandboxList,
-					client.InNamespace(namespace),
-					client.MatchingLabels{
-						agentsv1alpha1.LabelSandboxClaimedBy: secondClaimUID,
-					},
-				)).To(Succeed())
-				Expect(sandboxList.Items).To(HaveLen(2), "Second claim should have 2 NEW sandboxes")
+				secondClaimSandboxes, err := listClaimedSandboxes(ctx, sandboxClaim)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(secondClaimSandboxes).To(HaveLen(2), "Second claim should have 2 NEW sandboxes")
 
 				secondClaimSandboxNames := make([]string, 0, 2)
-				for _, sandbox := range sandboxList.Items {
+				for _, sandbox := range secondClaimSandboxes {
 					secondClaimSandboxNames = append(secondClaimSandboxNames, sandbox.Name)
 					// Verify second generation label
 					Expect(sandbox.Labels).To(HaveKeyWithValue("generation", "second"))
-					Expect(sandbox.Labels).To(HaveKeyWithValue(
-						agentsv1alpha1.LabelSandboxClaimedBy,
+					// Verify annotation (UID)
+					Expect(sandbox.Annotations).To(HaveKeyWithValue(
+						agentsv1alpha1.AnnotationOwner,
 						secondClaimUID,
 					))
+					// Verify label (Name for display)
 					Expect(sandbox.Labels).To(HaveKeyWithValue(
-						agentsv1alpha1.LabelSandboxClaimedByName,
+						agentsv1alpha1.LabelSandboxClaimName,
 						firstClaimName,
 					))
 				}
@@ -1569,17 +1523,20 @@ var _ = Describe("SandboxClaim", func() {
 				Expect(k8sClient.List(ctx, allSandboxList,
 					client.InNamespace(namespace),
 					client.MatchingLabels{
-						agentsv1alpha1.LabelSandboxClaimedByName: firstClaimName,
+						agentsv1alpha1.LabelSandboxClaimName: firstClaimName,
 					},
 				)).To(Succeed())
 				Expect(allSandboxList.Items).To(HaveLen(4),
 					"Should have 4 total sandboxes (2 from first claim + 2 from second claim)")
 
-				By("Verifying each sandbox has correct UID label")
+				By("Verifying each sandbox has correct UID annotation")
 				firstGenCount := 0
 				secondGenCount := 0
 				for _, sandbox := range allSandboxList.Items {
-					uid := sandbox.Labels[agentsv1alpha1.LabelSandboxClaimedBy]
+					uid := ""
+					if sandbox.Annotations != nil {
+						uid = sandbox.Annotations[agentsv1alpha1.AnnotationOwner]
+					}
 					if uid == firstClaimUID {
 						firstGenCount++
 						Expect(sandbox.Labels).To(HaveKeyWithValue("generation", "first"))
