@@ -19,9 +19,13 @@ OpenKruise Agents delivers vendor-neutral sandboxes with the following key chara
 3. User identity and session management with efficient traffic routing, minimizing dependence on Kubernetes services
 4. Comprehensive API and SDK support, including both Kubernetes CRD APIs and E2B APIs
 
-## Relationship with Sig Agent-Sandbox
 
-OpenKruise Agents offers high-level APIs for sandbox management, enabling efficient resource provisioning, user management, and traffic routing. Under the hood, OpenKruise Agents includes built-in sandbox APIs and implementations, while maintaining compatibility with Sig Agent-Sandbox when available.
+## Quick Start
+
+You can view the full documentation from the [OpenKruise website](https://openkruise.io/kruiseagents/introduction).
+
+- Install or upgrade OpenKruise Agents with [the stable version](https://openkruise.io/kruiseagents/installation).
+- Access OpenKruise Agents with [E2B SDK](https://openkruise.io/kruiseagents/developer-manuals/e2b-client) or [K8S SDK](https://github.com/openkruise/agents-api)
 
 ## Usage
 To interact with the OpenKruise Agents programmatically, you can use the E2B SDK, which provides a high-level interface for creating and managing sandboxes.
@@ -32,6 +36,11 @@ To interact with the OpenKruise Agents programmatically, you can use the E2B SDK
 ## Contributing
 
 You are warmly welcome to hack on OpenKruise Agents. We have prepared a detailed guide [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## Relationship with SIG Agent-Sandbox
+
+OpenKruise Agents offers high-level APIs for sandbox management, enabling efficient resource provisioning, user management, and traffic routing. Under the hood, OpenKruise Agents includes built-in sandbox APIs and implementations, while maintaining compatibility with Sig Agent-Sandbox when available.
+
 
 ## Community
 Active communication channels:

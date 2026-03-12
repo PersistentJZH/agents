@@ -425,12 +425,12 @@ func TestGeneratePodFromSandbox(t *testing.T) {
 	_ = agentsv1alpha1.AddToScheme(scheme)
 
 	tests := []struct {
-		name             string
-		sandbox          *agentsv1alpha1.Sandbox
+		name    string
+		sandbox *agentsv1alpha1.Sandbox
 
-		revision         string
-		wantErr          bool
-		checkPod         func(t *testing.T, pod *corev1.Pod)
+		revision string
+		wantErr  bool
+		checkPod func(t *testing.T, pod *corev1.Pod)
 	}{
 		{
 			name: "inline template - basic pod generation",
