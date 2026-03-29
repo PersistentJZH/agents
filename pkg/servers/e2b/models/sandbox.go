@@ -3,6 +3,7 @@ package models
 
 import (
 	"github.com/openkruise/agents/api/v1alpha1"
+	corev1 "k8s.io/api/core/v1"
 )
 
 const (
@@ -53,7 +54,13 @@ type NewSandboxRequestExtension struct {
 }
 
 type InplaceUpdateExtension struct {
-	Image string
+	Image     string
+	Resources *InplaceUpdateResourcesExtension
+}
+
+type InplaceUpdateResourcesExtension struct {
+	Requests corev1.ResourceList
+	Limits   corev1.ResourceList
 }
 
 type CSIMountExtension struct {

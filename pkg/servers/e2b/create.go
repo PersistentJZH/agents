@@ -12,12 +12,14 @@ import (
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/klog/v2"
 
+	"github.com/openkruise/agents/pkg/features"
 	"github.com/openkruise/agents/pkg/sandbox-manager/config"
 	"github.com/openkruise/agents/pkg/sandbox-manager/infra"
 	"github.com/openkruise/agents/pkg/servers/e2b/models"
 	"github.com/openkruise/agents/pkg/servers/web"
 	"github.com/openkruise/agents/pkg/utils"
 	"github.com/openkruise/agents/pkg/utils/csiutils"
+	utilfeature "github.com/openkruise/agents/pkg/utils/feature"
 )
 
 // CreateSandbox allocates a Pod as a new sandbox
@@ -76,9 +78,21 @@ func (sc *Controller) createSandboxWithClaim(ctx context.Context, request models
 		}
 	}
 
-	if extension := request.Extensions.InplaceUpdate; extension.Image != "" {
+	if extension := request.Extensions.InplaceUpdate; extension.Image != "" || extension.Resources != nil {
 		opts.InplaceUpdate = &config.InplaceUpdateOptions{
 			Image: extension.Image,
+		}
+		if extension.Resources != nil && (len(extension.Resources.Requests) > 0 || len(extension.Resources.Limits) > 0) {
+			if !utilfeature.DefaultFeatureGate.Enabled(features.SandboxClaimInPlaceCPUResizeGate) {
+				return web.ApiResponse[*models.Sandbox]{}, &web.ApiError{
+					Code:    http.StatusBadRequest,
+					Message: fmt.Sprintf("in-place resource resize is disabled by feature gate %s", features.SandboxClaimInPlaceCPUResizeGate),
+				}
+			}
+			opts.InplaceUpdate.Resources = &config.InplaceUpdateResourcesOptions{
+				Requests: extension.Resources.Requests,
+				Limits:   extension.Resources.Limits,
+			}
 		}
 	}
 

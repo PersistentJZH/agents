@@ -42,6 +42,9 @@ const (
 	// CachePodLabelSelectorGate enables label selector filtering on the Pod informer cache
 	// to reduce memory consumption.
 	CachePodLabelSelectorGate featuregate.Feature = "CachePodLabelSelector"
+
+	// SandboxClaimInPlaceCPUResizeGate enables in-place CPU resize when claiming sandboxes.
+	SandboxClaimInPlaceCPUResizeGate featuregate.Feature = "SandboxClaimInPlaceCPUResize"
 )
 
 var defaultFeatureGates = map[featuregate.Feature]featuregate.FeatureSpec{
@@ -51,6 +54,7 @@ var defaultFeatureGates = map[featuregate.Feature]featuregate.FeatureSpec{
 	SandboxCreatePodRateLimitGate:    {Default: false, PreRelease: featuregate.Alpha},
 	SandboxCreatePodInjectConfigGate: {Default: false, PreRelease: featuregate.Alpha},
 	CachePodLabelSelectorGate:        {Default: true, PreRelease: featuregate.Alpha},
+	SandboxClaimInPlaceCPUResizeGate: {Default: true, PreRelease: featuregate.Alpha},
 }
 
 func init() {

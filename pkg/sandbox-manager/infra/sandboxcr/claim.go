@@ -14,7 +14,9 @@ import (
 
 	"github.com/google/uuid"
 	"golang.org/x/time/rate"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/util/retry"
@@ -49,9 +51,20 @@ func ValidateAndInitClaimOptions(opts infra.ClaimSandboxOptions) (infra.ClaimSan
 			return infra.ClaimSandboxOptions{}, fmt.Errorf("init runtime is required when csi mount is specified")
 		}
 	}
-	if opts.InplaceUpdate != nil {
-		if opts.InplaceUpdate.Image == "" {
-			return infra.ClaimSandboxOptions{}, fmt.Errorf("inplace update image is required")
+	if opts.InplaceUpdate != nil && opts.InplaceUpdate.Image == "" && opts.InplaceUpdate.Resources == nil {
+		return infra.ClaimSandboxOptions{}, fmt.Errorf("inplace update requires either image or resources to be set")
+	}
+	if opts.InplaceUpdate != nil && opts.InplaceUpdate.Resources != nil {
+		res := opts.InplaceUpdate.Resources
+		if len(res.Requests) == 0 && len(res.Limits) == 0 {
+			return infra.ClaimSandboxOptions{}, fmt.Errorf("resources must specify at least one of requests or limits")
+		}
+		for _, rl := range []corev1.ResourceList{res.Requests, res.Limits} {
+			if cpu, ok := rl[corev1.ResourceCPU]; ok {
+				if cpu.IsZero() || cpu.Cmp(resource.Quantity{}) < 0 {
+					return infra.ClaimSandboxOptions{}, fmt.Errorf("target cpu must be a positive value")
+				}
+			}
 		}
 	}
 	if opts.CandidateCounts <= 0 {
@@ -413,8 +426,12 @@ func modifyPickedSandbox(sbx *Sandbox, lockType infra.LockType, opts infra.Claim
 		opts.Modifier(sbx)
 	}
 	if opts.InplaceUpdate != nil {
-		// should perform an inplace update
-		sbx.SetImage(opts.InplaceUpdate.Image)
+		if opts.InplaceUpdate.Image != "" {
+			sbx.SetImage(opts.InplaceUpdate.Image)
+		}
+		if opts.InplaceUpdate.Resources != nil {
+			sbx.SetResources(opts.InplaceUpdate.Resources.Requests, opts.InplaceUpdate.Resources.Limits)
+		}
 	}
 	// claim sandbox
 	sbx.SetOwnerReferences([]metav1.OwnerReference{}) // make SandboxSet scale up
@@ -453,6 +470,18 @@ func modifyPickedSandbox(sbx *Sandbox, lockType infra.LockType, opts infra.Claim
 
 	sbx.SetAnnotations(annotations)
 	return nil
+}
+
+// SetResources applies in-place resource resize to the first container.
+func (s *Sandbox) SetResources(requests, limits corev1.ResourceList) {
+	if s.Spec.Template == nil {
+		return
+	}
+	pod := &corev1.Pod{
+		Spec: s.Spec.Template.Spec,
+	}
+	resizedPod, _ := buildResourceResizedPod(pod, requests, limits)
+	s.Spec.Template.Spec = resizedPod.Spec
 }
 
 var DefaultCreateSandbox = createSandbox
@@ -552,6 +581,54 @@ func initRuntime(ctx context.Context, sbx *Sandbox, opts config.InitRuntimeOptio
 		return nil
 	})
 	return time.Since(start), err
+}
+
+func buildResourceResizedPod(pod *corev1.Pod, requests, limits corev1.ResourceList) (*corev1.Pod, bool) {
+	if len(pod.Spec.Containers) == 0 {
+		return pod.DeepCopy(), false
+	}
+	clone := pod.DeepCopy()
+	changed := setContainerResources(&clone.Spec.Containers[0], requests, limits)
+	return clone, changed
+}
+
+// supportedResizeResources defines which resources are allowed for in-place resize.
+var supportedResizeResources = map[corev1.ResourceName]bool{
+	corev1.ResourceCPU: true,
+}
+
+// setContainerResources updates the container's requests and limits for resources
+// listed in supportedResizeResources. Unsupported resource types are silently ignored.
+// A resource is also skipped if it was not originally set on the container.
+func setContainerResources(container *corev1.Container, requests, limits corev1.ResourceList) bool {
+	changed := false
+	for resName, target := range requests {
+		if !supportedResizeResources[resName] {
+			continue
+		}
+		if cur, ok := container.Resources.Requests[resName]; !ok || cur.IsZero() {
+			continue
+		}
+		if container.Resources.Requests == nil {
+			container.Resources.Requests = corev1.ResourceList{}
+		}
+		container.Resources.Requests[resName] = target.DeepCopy()
+		changed = true
+	}
+	for resName, target := range limits {
+		if !supportedResizeResources[resName] {
+			continue
+		}
+		if cur, ok := container.Resources.Limits[resName]; !ok || cur.IsZero() {
+			continue
+		}
+		if container.Resources.Limits == nil {
+			container.Resources.Limits = corev1.ResourceList{}
+		}
+		container.Resources.Limits[resName] = target.DeepCopy()
+		changed = true
+	}
+	return changed
 }
 
 func waitForSandboxReady(ctx context.Context, sbx *Sandbox, opts infra.ClaimSandboxOptions, cache *Cache) (cost time.Duration, err error) {

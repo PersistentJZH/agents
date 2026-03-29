@@ -39,6 +39,13 @@ import (
 	"github.com/openkruise/agents/pkg/utils"
 	"github.com/openkruise/agents/pkg/utils/csiutils"
 	stateutils "github.com/openkruise/agents/pkg/utils/sandboxutils"
+
+	agentsv1alpha1 "github.com/openkruise/agents/api/v1alpha1"
+	"github.com/openkruise/agents/pkg/features"
+	"github.com/openkruise/agents/pkg/sandbox-manager/clients"
+	"github.com/openkruise/agents/pkg/sandbox-manager/infra"
+	"github.com/openkruise/agents/pkg/sandbox-manager/infra/sandboxcr"
+	utilfeature "github.com/openkruise/agents/pkg/utils/feature"
 )
 
 type commonControl struct {
@@ -291,6 +298,15 @@ func (c *commonControl) buildClaimOptions(ctx context.Context, claim *agentsv1al
 		opts.InplaceUpdate = &config.InplaceUpdateOptions{
 			Image: claim.Spec.InplaceUpdate.Image,
 		}
+		if res := claim.Spec.InplaceUpdate.Resources; res != nil && (len(res.Requests) > 0 || len(res.Limits) > 0) {
+			if !utilfeature.DefaultFeatureGate.Enabled(features.SandboxClaimInPlaceCPUResizeGate) {
+				return infra.ClaimSandboxOptions{}, fmt.Errorf("in-place resource resize is disabled by feature gate %s", features.SandboxClaimInPlaceCPUResizeGate)
+			}
+			opts.InplaceUpdate.Resources = &config.InplaceUpdateResourcesOptions{
+				Requests: res.Requests,
+				Limits:   res.Limits,
+			}
+		}
 	}
 
 	if claim.Spec.WaitReadyTimeout != nil {
@@ -303,7 +319,6 @@ func (c *commonControl) buildClaimOptions(ctx context.Context, claim *agentsv1al
 			AccessToken: uuid.NewString(),
 		}
 	}
-
 	if len(claim.Spec.DynamicVolumesMount) > 0 {
 		csiMountOptions := make([]config.MountConfig, 0, len(claim.Spec.DynamicVolumesMount))
 		csiClient := csiutils.NewCSIMountHandler(c.sandboxClient, c.cache, c.storageRegistry, utils.DefaultSandboxDeployNamespace)

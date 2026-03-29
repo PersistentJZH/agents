@@ -22,16 +22,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
-	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
-	k8sfake "k8s.io/client-go/kubernetes/fake"
-	"k8s.io/client-go/tools/record"
-	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
-
 	agentsv1alpha1 "github.com/openkruise/agents/api/v1alpha1"
 	"github.com/openkruise/agents/client/clientset/versioned"
 	sandboxfake "github.com/openkruise/agents/client/clientset/versioned/fake"
@@ -40,6 +30,17 @@ import (
 	"github.com/openkruise/agents/pkg/sandbox-manager/config"
 	"github.com/openkruise/agents/pkg/sandbox-manager/infra"
 	"github.com/openkruise/agents/pkg/sandbox-manager/infra/sandboxcr"
+	utilfeature "github.com/openkruise/agents/pkg/utils/feature"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	k8sfake "k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/tools/record"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
 func TestNewCommonControl(t *testing.T) {
@@ -865,6 +866,117 @@ func TestCommonControl_buildClaimOptions(t *testing.T) {
 			},
 		},
 		{
+			name: "claim with inplaceUpdate resources",
+			claim: &agentsv1alpha1.SandboxClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-claim-cpu-resize",
+					Namespace: "default",
+					UID:       "test-uid-cpu-resize",
+				},
+				Spec: agentsv1alpha1.SandboxClaimSpec{
+					TemplateName: "test-template",
+					InplaceUpdate: &agentsv1alpha1.SandboxClaimInplaceUpdateOptions{
+						Resources: &agentsv1alpha1.SandboxClaimInplaceUpdateResourcesOptions{
+							Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m")},
+							Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m")},
+						},
+					},
+				},
+			},
+			sandboxSet: &agentsv1alpha1.SandboxSet{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-template",
+					Namespace: "default",
+				},
+			},
+			expectError: false,
+			validate: func(t *testing.T, opts infra.ClaimSandboxOptions) {
+				if opts.InplaceUpdate == nil || opts.InplaceUpdate.Resources == nil {
+					t.Fatal("InplaceUpdate.Resources should not be nil")
+				}
+				reqCPU := opts.InplaceUpdate.Resources.Requests[corev1.ResourceCPU]
+				if reqCPU.String() != "500m" {
+					t.Errorf("InplaceUpdate.Resources.Requests[cpu] = %v, want 500m", reqCPU.String())
+				}
+			},
+		},
+		{
+			name: "claim with zero cpu target",
+			claim: &agentsv1alpha1.SandboxClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-claim-invalid-cpu-resize",
+					Namespace: "default",
+					UID:       "test-uid-invalid-cpu-resize",
+				},
+				Spec: agentsv1alpha1.SandboxClaimSpec{
+					TemplateName: "test-template",
+					InplaceUpdate: &agentsv1alpha1.SandboxClaimInplaceUpdateOptions{
+						Resources: &agentsv1alpha1.SandboxClaimInplaceUpdateResourcesOptions{
+							Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("0")},
+						},
+					},
+				},
+			},
+			sandboxSet: &agentsv1alpha1.SandboxSet{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-template",
+					Namespace: "default",
+				},
+			},
+			expectError: true,
+		},
+		{
+			name: "claim with all fields",
+			claim: &agentsv1alpha1.SandboxClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-claim-full",
+					Namespace: "default",
+					UID:       "test-uid-full",
+				},
+				Spec: agentsv1alpha1.SandboxClaimSpec{
+					TemplateName: "test-template",
+					Labels: map[string]string{
+						"app": "test",
+					},
+					Annotations: map[string]string{
+						"note": "test",
+					},
+					ShutdownTime: &shutdownTime,
+					InplaceUpdate: &agentsv1alpha1.SandboxClaimInplaceUpdateOptions{
+						Image: "postgres:16",
+					},
+					WaitReadyTimeout: &timeoutDuration,
+				},
+			},
+			sandboxSet: &agentsv1alpha1.SandboxSet{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-template",
+					Namespace: "default",
+				},
+			},
+			expectError: false,
+			validate: func(t *testing.T, opts infra.ClaimSandboxOptions) {
+				if opts.User != "test-uid-full" {
+					t.Errorf("User = %v, want %v", opts.User, "test-uid-full")
+				}
+				if opts.Template != "test-template" {
+					t.Errorf("Template = %v, want %v", opts.Template, "test-template")
+				}
+				if opts.Modifier == nil {
+					t.Error("Modifier should not be nil")
+				}
+				if opts.InplaceUpdate == nil {
+					t.Fatal("InplaceUpdate should not be nil")
+				}
+				if opts.InplaceUpdate.Image != "postgres:16" {
+					t.Errorf("InplaceUpdate.Image = %v, want %v", opts.InplaceUpdate.Image, "postgres:16")
+				}
+				if opts.WaitReadyTimeout != 3*time.Minute {
+					t.Errorf("WaitReadyTimeout = %v, want %v", opts.WaitReadyTimeout, 3*time.Minute)
+				}
+			},
+		},
+		{
 			name: "claim with runtimes",
 			claim: &agentsv1alpha1.SandboxClaim{
 				ObjectMeta: metav1.ObjectMeta{
@@ -1027,6 +1139,11 @@ func TestCommonControl_buildClaimOptions(t *testing.T) {
 		},
 	}
 
+	_ = utilfeature.DefaultMutableFeatureGate.Set("SandboxClaimInPlaceCPUResize=true")
+	t.Cleanup(func() {
+		_ = utilfeature.DefaultMutableFeatureGate.Set("SandboxClaimInPlaceCPUResize=false")
+	})
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			opts, err := control.buildClaimOptions(ctx, tt.claim, tt.sandboxSet)
@@ -1040,6 +1157,33 @@ func TestCommonControl_buildClaimOptions(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("cpu resize rejected when feature gate disabled", func(t *testing.T) {
+		_ = utilfeature.DefaultMutableFeatureGate.Set("SandboxClaimInPlaceCPUResize=false")
+		defer func() {
+			_ = utilfeature.DefaultMutableFeatureGate.Set("SandboxClaimInPlaceCPUResize=true")
+		}()
+
+		claim := &agentsv1alpha1.SandboxClaim{
+			ObjectMeta: metav1.ObjectMeta{Name: "gate-test", Namespace: "default", UID: "gate-uid"},
+			Spec: agentsv1alpha1.SandboxClaimSpec{
+				TemplateName: "test-template",
+				InplaceUpdate: &agentsv1alpha1.SandboxClaimInplaceUpdateOptions{
+					Resources: &agentsv1alpha1.SandboxClaimInplaceUpdateResourcesOptions{
+						Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m")},
+						Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m")},
+					},
+				},
+			},
+		}
+		ss := &agentsv1alpha1.SandboxSet{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-template", Namespace: "default"},
+		}
+		_, err := control.buildClaimOptions(ctx, claim, ss)
+		if err == nil {
+			t.Fatal("expected error when feature gate is disabled")
+		}
+	})
 }
 
 // Helper function for tests

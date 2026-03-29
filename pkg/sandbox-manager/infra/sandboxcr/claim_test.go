@@ -14,9 +14,12 @@ import (
 	"golang.org/x/time/rate"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/rand"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/klog/v2"
 
 	"github.com/openkruise/agents/api/v1alpha1"
 	agentsv1alpha1 "github.com/openkruise/agents/api/v1alpha1"
@@ -207,6 +210,42 @@ func TestInfra_ClaimSandbox(t *testing.T) {
 			},
 			postCheck: func(t *testing.T, sbx infra.Sandbox) {
 				assert.Equal(t, "new-image", sbx.(*Sandbox).Spec.Template.Spec.Containers[0].Image)
+				metrics := GetMetricsFromSandbox(t, sbx)
+				assert.Greater(t, metrics.WaitReady, time.Duration(0))
+			},
+		},
+		{
+			name:      "claim with cpu resize",
+			available: 1,
+			options: infra.ClaimSandboxOptions{
+				User:     user,
+				Template: existTemplate,
+				InplaceUpdate: &config.InplaceUpdateOptions{
+					Resources: &config.InplaceUpdateResourcesOptions{
+						Requests: corev1.ResourceList{
+							corev1.ResourceCPU: resource.MustParse("1"),
+						},
+						Limits: corev1.ResourceList{
+							corev1.ResourceCPU: resource.MustParse("1"),
+						},
+					},
+				},
+			},
+			preModifier: func(sbx *v1alpha1.Sandbox, infra *Infra) {
+				reqCPU := resource.MustParse("500m")
+				reqMem := resource.MustParse("512Mi")
+				sbx.Spec.Template.Spec.Containers[0].Resources = corev1.ResourceRequirements{
+					Requests: corev1.ResourceList{
+						corev1.ResourceCPU:    reqCPU,
+						corev1.ResourceMemory: reqMem,
+					},
+					Limits: corev1.ResourceList{
+						corev1.ResourceCPU:    reqCPU,
+						corev1.ResourceMemory: reqMem,
+					},
+				}
+			},
+			postCheck: func(t *testing.T, sbx infra.Sandbox) {
 				metrics := GetMetricsFromSandbox(t, sbx)
 				assert.Greater(t, metrics.WaitReady, time.Duration(0))
 			},
@@ -753,6 +792,865 @@ func TestCheckSandboxInplaceUpdate(t *testing.T) {
 				assert.NoError(t, err)
 			}
 		})
+	}
+}
+
+func TestModifyPickedSandboxCPUResize(t *testing.T) {
+	base := &Sandbox{
+		Sandbox: &v1alpha1.Sandbox{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "sbx-1",
+				Namespace: "default",
+				Labels: map[string]string{
+					v1alpha1.LabelSandboxTemplate:  "test-template",
+					v1alpha1.LabelSandboxIsClaimed: "false",
+				},
+				Annotations: map[string]string{},
+			},
+			Spec: v1alpha1.SandboxSpec{
+				EmbeddedSandboxTemplate: v1alpha1.EmbeddedSandboxTemplate{
+					Template: &corev1.PodTemplateSpec{
+						Spec: corev1.PodSpec{
+							Containers: []corev1.Container{
+								{
+									Name:  "main",
+									Image: "img",
+									Resources: corev1.ResourceRequirements{
+										Requests: corev1.ResourceList{
+											corev1.ResourceCPU:    resource.MustParse("250m"),
+											corev1.ResourceMemory: resource.MustParse("256Mi"),
+										},
+										Limits: corev1.ResourceList{
+											corev1.ResourceCPU:    resource.MustParse("250m"),
+											corev1.ResourceMemory: resource.MustParse("256Mi"),
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	err := modifyPickedSandbox(base, infra.LockTypeUpdate, infra.ClaimSandboxOptions{
+		User:     "u1",
+		Template: "test-template",
+		InplaceUpdate: &config.InplaceUpdateOptions{
+			Resources: &config.InplaceUpdateResourcesOptions{
+				Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m")},
+				Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m")},
+			},
+		},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, int64(500), base.Spec.Template.Spec.Containers[0].Resources.Requests.Cpu().MilliValue())
+	assert.Equal(t, int64(500), base.Spec.Template.Spec.Containers[0].Resources.Limits.Cpu().MilliValue())
+}
+
+func TestModifyPickedSandboxCPUResizeCases(t *testing.T) {
+	tests := []struct {
+		name string
+
+		templateSpec   corev1.PodSpec
+		inplaceReq     corev1.ResourceList
+		inplaceLim     corev1.ResourceList
+		wantReqCPU     int64
+		wantLimCPU     int64
+		wantSidecarCPU int64
+	}{
+		{
+			name: "requests only - set target",
+			templateSpec: corev1.PodSpec{
+				Containers: []corev1.Container{
+					{
+						Name:  "main",
+						Image: "img",
+						Resources: corev1.ResourceRequirements{
+							Requests: corev1.ResourceList{
+								corev1.ResourceCPU: resource.MustParse("100m"),
+							},
+						},
+					},
+				},
+			},
+			inplaceReq: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("200m")},
+			wantReqCPU: 200,
+			wantLimCPU: 0,
+		},
+		{
+			name: "limits only - set target",
+			templateSpec: corev1.PodSpec{
+				Containers: []corev1.Container{
+					{
+						Name:  "main",
+						Image: "img",
+						Resources: corev1.ResourceRequirements{
+							Limits: corev1.ResourceList{
+								corev1.ResourceCPU: resource.MustParse("500m"),
+							},
+						},
+					},
+				},
+			},
+			inplaceLim: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1")},
+			wantReqCPU: 0,
+			wantLimCPU: 1000,
+		},
+		{
+			name: "no cpu resources - no change",
+			templateSpec: corev1.PodSpec{
+				Containers: []corev1.Container{
+					{
+						Name:  "main",
+						Image: "img",
+						Resources: corev1.ResourceRequirements{
+							Requests: corev1.ResourceList{
+								corev1.ResourceMemory: resource.MustParse("256Mi"),
+							},
+							Limits: corev1.ResourceList{
+								corev1.ResourceMemory: resource.MustParse("512Mi"),
+							},
+						},
+					},
+				},
+			},
+			inplaceReq: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("200m")},
+			wantReqCPU: 0,
+			wantLimCPU: 0,
+		},
+		{
+			name: "empty resources - no change",
+			templateSpec: corev1.PodSpec{
+				Containers: []corev1.Container{
+					{
+						Name:      "main",
+						Image:     "img",
+						Resources: corev1.ResourceRequirements{},
+					},
+				},
+			},
+			inplaceReq: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("200m")},
+			wantReqCPU: 0,
+			wantLimCPU: 0,
+		},
+		{
+			name: "set lower target",
+			templateSpec: corev1.PodSpec{
+				Containers: []corev1.Container{
+					{
+						Name:  "main",
+						Image: "img",
+						Resources: corev1.ResourceRequirements{
+							Requests: corev1.ResourceList{
+								corev1.ResourceCPU: resource.MustParse("500m"),
+							},
+							Limits: corev1.ResourceList{
+								corev1.ResourceCPU: resource.MustParse("500m"),
+							},
+						},
+					},
+				},
+			},
+			inplaceReq: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("250m")},
+			inplaceLim: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("250m")},
+			wantReqCPU: 250,
+			wantLimCPU: 250,
+		},
+		{
+			name: "only first container gets target - sidecar unchanged",
+			templateSpec: corev1.PodSpec{
+				Containers: []corev1.Container{
+					{
+						Name:  "main",
+						Image: "img",
+						Resources: corev1.ResourceRequirements{
+							Requests: corev1.ResourceList{
+								corev1.ResourceCPU: resource.MustParse("100m"),
+							},
+						},
+					},
+					{
+						Name:  "sidecar",
+						Image: "img",
+						Resources: corev1.ResourceRequirements{
+							Limits: corev1.ResourceList{
+								corev1.ResourceCPU: resource.MustParse("200m"),
+							},
+						},
+					},
+				},
+			},
+			inplaceReq:     corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("300m")},
+			inplaceLim:     corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("300m")},
+			wantReqCPU:     300,
+			wantLimCPU:     0,
+			wantSidecarCPU: 200,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sbx := &Sandbox{
+				Sandbox: &v1alpha1.Sandbox{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "sbx-1",
+						Namespace: "default",
+						Labels: map[string]string{
+							v1alpha1.LabelSandboxTemplate:  "test-template",
+							v1alpha1.LabelSandboxIsClaimed: "false",
+						},
+						Annotations: map[string]string{},
+					},
+					Spec: v1alpha1.SandboxSpec{
+						EmbeddedSandboxTemplate: v1alpha1.EmbeddedSandboxTemplate{
+							Template: &corev1.PodTemplateSpec{
+								Spec: tt.templateSpec,
+							},
+						},
+					},
+				},
+			}
+
+			err := modifyPickedSandbox(sbx, infra.LockTypeUpdate, infra.ClaimSandboxOptions{
+				User:     "u1",
+				Template: "test-template",
+				InplaceUpdate: &config.InplaceUpdateOptions{
+					Resources: &config.InplaceUpdateResourcesOptions{
+						Requests: tt.inplaceReq,
+						Limits:   tt.inplaceLim,
+					},
+				},
+			})
+			require.NoError(t, err)
+
+			if tt.wantReqCPU > 0 {
+				assert.Equal(t, tt.wantReqCPU, sbx.Spec.Template.Spec.Containers[0].Resources.Requests.Cpu().MilliValue())
+			}
+			if tt.wantLimCPU > 0 {
+				assert.Equal(t, tt.wantLimCPU, sbx.Spec.Template.Spec.Containers[0].Resources.Limits.Cpu().MilliValue())
+			}
+			if tt.wantSidecarCPU > 0 {
+				assert.Equal(t, tt.wantSidecarCPU, sbx.Spec.Template.Spec.Containers[1].Resources.Limits.Cpu().MilliValue())
+			}
+		})
+	}
+}
+
+func TestModifyPickedSandboxCPUNilTemplate(t *testing.T) {
+	sbx := &Sandbox{
+		Sandbox: &v1alpha1.Sandbox{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:        "sbx-1",
+				Namespace:   "default",
+				Labels:      map[string]string{},
+				Annotations: map[string]string{},
+			},
+			Spec: v1alpha1.SandboxSpec{
+				EmbeddedSandboxTemplate: v1alpha1.EmbeddedSandboxTemplate{
+					Template: nil,
+				},
+			},
+		},
+	}
+
+	err := modifyPickedSandbox(sbx, infra.LockTypeUpdate, infra.ClaimSandboxOptions{
+		User:     "u1",
+		Template: "test-template",
+		InplaceUpdate: &config.InplaceUpdateOptions{
+			Resources: &config.InplaceUpdateResourcesOptions{
+				Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m")},
+				Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m")},
+			},
+		},
+	})
+	require.NoError(t, err)
+	assert.Nil(t, sbx.Spec.Template)
+}
+
+func TestBuildContainerCPUTargets(t *testing.T) {
+	tests := []struct {
+		name       string
+		podSpec    corev1.PodSpec
+		wantNames  []string
+		wantReqCPU map[string]int64
+		wantLimCPU map[string]int64
+	}{
+		{
+			name: "only requests",
+			podSpec: corev1.PodSpec{
+				Containers: []corev1.Container{
+					{Name: "c1", Resources: corev1.ResourceRequirements{
+						Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("100m")},
+					}},
+				},
+			},
+			wantNames:  []string{"c1"},
+			wantReqCPU: map[string]int64{"c1": 100},
+			wantLimCPU: map[string]int64{},
+		},
+		{
+			name: "only limits",
+			podSpec: corev1.PodSpec{
+				Containers: []corev1.Container{
+					{Name: "c1", Resources: corev1.ResourceRequirements{
+						Limits: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("200m")},
+					}},
+				},
+			},
+			wantNames:  []string{"c1"},
+			wantReqCPU: map[string]int64{},
+			wantLimCPU: map[string]int64{"c1": 200},
+		},
+		{
+			name: "no cpu resources",
+			podSpec: corev1.PodSpec{
+				Containers: []corev1.Container{
+					{Name: "c1", Resources: corev1.ResourceRequirements{
+						Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("128Mi")},
+					}},
+				},
+			},
+			wantNames:  []string{},
+			wantReqCPU: map[string]int64{},
+			wantLimCPU: map[string]int64{},
+		},
+		{
+			name: "init container with cpu",
+			podSpec: corev1.PodSpec{
+				InitContainers: []corev1.Container{
+					{Name: "init", Resources: corev1.ResourceRequirements{
+						Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("50m")},
+						Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("100m")},
+					}},
+				},
+				Containers: []corev1.Container{
+					{Name: "main", Resources: corev1.ResourceRequirements{
+						Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("200m")},
+					}},
+				},
+			},
+			wantNames:  []string{"init", "main"},
+			wantReqCPU: map[string]int64{"init": 50, "main": 200},
+			wantLimCPU: map[string]int64{"init": 100},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pod := &corev1.Pod{Spec: tt.podSpec}
+			targets := buildContainerCPUTargets(pod)
+			if len(tt.wantNames) == 0 {
+				assert.Empty(t, targets)
+				return
+			}
+			for _, name := range tt.wantNames {
+				target, ok := targets[name]
+				require.True(t, ok, "expected container %s in targets", name)
+				if req, ok := tt.wantReqCPU[name]; ok {
+					assert.Equal(t, req, target.request.MilliValue())
+				}
+				if lim, ok := tt.wantLimCPU[name]; ok {
+					assert.Equal(t, lim, target.limit.MilliValue())
+				}
+			}
+		})
+	}
+}
+
+func TestIsPodCPUResizeApplied(t *testing.T) {
+	tests := []struct {
+		name                  string
+		targets               map[string]containerCPUTarget
+		containerStatuses     []corev1.ContainerStatus
+		initContainerStatuses []corev1.ContainerStatus
+		want                  bool
+	}{
+		{
+			name:    "empty targets",
+			targets: map[string]containerCPUTarget{},
+			want:    false,
+		},
+		{
+			name:    "container status missing",
+			targets: map[string]containerCPUTarget{"main": {request: resource.MustParse("100m"), hasRequest: true}},
+			containerStatuses: []corev1.ContainerStatus{
+				{Name: "sidecar", Resources: &corev1.ResourceRequirements{
+					Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("100m")},
+				}},
+			},
+			want: false,
+		},
+		{
+			name:    "nil resources in status",
+			targets: map[string]containerCPUTarget{"main": {request: resource.MustParse("100m"), hasRequest: true}},
+			containerStatuses: []corev1.ContainerStatus{
+				{Name: "main", Resources: nil},
+			},
+			want: false,
+		},
+		{
+			name:    "request not matching",
+			targets: map[string]containerCPUTarget{"main": {request: resource.MustParse("200m"), hasRequest: true}},
+			containerStatuses: []corev1.ContainerStatus{
+				{Name: "main", Resources: &corev1.ResourceRequirements{
+					Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("100m")},
+				}},
+			},
+			want: false,
+		},
+		{
+			name:    "limit not matching",
+			targets: map[string]containerCPUTarget{"main": {limit: resource.MustParse("500m"), hasLimit: true}},
+			containerStatuses: []corev1.ContainerStatus{
+				{Name: "main", Resources: &corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("400m")},
+				}},
+			},
+			want: false,
+		},
+		{
+			name:    "applied",
+			targets: map[string]containerCPUTarget{"main": {request: resource.MustParse("200m"), limit: resource.MustParse("400m"), hasRequest: true, hasLimit: true}},
+			containerStatuses: []corev1.ContainerStatus{
+				{Name: "main", Resources: &corev1.ResourceRequirements{
+					Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("200m")},
+					Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("400m")},
+				}},
+			},
+			want: true,
+		},
+		{
+			name:    "init container applied",
+			targets: map[string]containerCPUTarget{"init": {request: resource.MustParse("50m"), hasRequest: true}},
+			containerStatuses: []corev1.ContainerStatus{
+				{Name: "main", Resources: &corev1.ResourceRequirements{
+					Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("200m")},
+				}},
+			},
+			initContainerStatuses: []corev1.ContainerStatus{
+				{Name: "init", Resources: &corev1.ResourceRequirements{
+					Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("50m")},
+				}},
+			},
+			want: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pod := &corev1.Pod{
+				Status: corev1.PodStatus{
+					ContainerStatuses:     tt.containerStatuses,
+					InitContainerStatuses: tt.initContainerStatuses,
+				},
+			}
+			got := isPodCPUResizeApplied(pod, tt.targets)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestBuildResourceResizedPod(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-pod",
+			Namespace: "default",
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{
+				{
+					Name: "main",
+					Resources: corev1.ResourceRequirements{
+						Requests: corev1.ResourceList{
+							corev1.ResourceCPU:    resource.MustParse("250m"),
+							corev1.ResourceMemory: resource.MustParse("256Mi"),
+						},
+						Limits: corev1.ResourceList{
+							corev1.ResourceCPU:    resource.MustParse("250m"),
+							corev1.ResourceMemory: resource.MustParse("256Mi"),
+						},
+					},
+				},
+			},
+		},
+		Status: corev1.PodStatus{
+			QOSClass: corev1.PodQOSGuaranteed,
+		},
+	}
+
+	targetCPU := resource.MustParse("500m")
+	requests := corev1.ResourceList{corev1.ResourceCPU: targetCPU}
+	limits := corev1.ResourceList{corev1.ResourceCPU: targetCPU}
+	got, changed := buildResourceResizedPod(pod, requests, limits)
+	require.True(t, changed)
+	assert.Equal(t, int64(500), got.Spec.Containers[0].Resources.Requests.Cpu().MilliValue())
+	assert.Equal(t, int64(500), got.Spec.Containers[0].Resources.Limits.Cpu().MilliValue())
+}
+
+func TestValidateAndInitClaimOptions_CPUResize(t *testing.T) {
+	_, err := ValidateAndInitClaimOptions(infra.ClaimSandboxOptions{
+		User:     "u",
+		Template: "t",
+		InplaceUpdate: &config.InplaceUpdateOptions{
+			Resources: &config.InplaceUpdateResourcesOptions{
+				Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("0")},
+			},
+		},
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "target cpu must be a positive value")
+}
+
+// --- Pod resize state helpers (test-only, used by TestWaitForPodResizeState and related tests) ---
+
+type containerCPUTarget struct {
+	request    resource.Quantity
+	hasRequest bool
+	limit      resource.Quantity
+	hasLimit   bool
+}
+
+func buildContainerCPUTargets(pod *corev1.Pod) map[string]containerCPUTarget {
+	targets := make(map[string]containerCPUTarget, len(pod.Spec.Containers)+len(pod.Spec.InitContainers))
+	for _, c := range pod.Spec.Containers {
+		target := containerCPUTarget{}
+		if c.Resources.Requests != nil {
+			cpuReq, ok := c.Resources.Requests[corev1.ResourceCPU]
+			if ok {
+				target.request = cpuReq
+				target.hasRequest = true
+			}
+		}
+		if c.Resources.Limits != nil {
+			cpuLim, ok := c.Resources.Limits[corev1.ResourceCPU]
+			if ok {
+				target.limit = cpuLim
+				target.hasLimit = true
+			}
+		}
+		if target.hasRequest || target.hasLimit {
+			targets[c.Name] = target
+		}
+	}
+	for _, c := range pod.Spec.InitContainers {
+		target := containerCPUTarget{}
+		if c.Resources.Requests != nil {
+			cpuReq, ok := c.Resources.Requests[corev1.ResourceCPU]
+			if ok {
+				target.request = cpuReq
+				target.hasRequest = true
+			}
+		}
+		if c.Resources.Limits != nil {
+			cpuLim, ok := c.Resources.Limits[corev1.ResourceCPU]
+			if ok {
+				target.limit = cpuLim
+				target.hasLimit = true
+			}
+		}
+		if target.hasRequest || target.hasLimit {
+			targets[c.Name] = target
+		}
+	}
+	return targets
+}
+
+func isPodCPUResizeApplied(pod *corev1.Pod, targets map[string]containerCPUTarget) bool {
+	if len(targets) == 0 {
+		return false
+	}
+	statuses := make(map[string]*corev1.ContainerStatus, len(pod.Status.ContainerStatuses)+len(pod.Status.InitContainerStatuses))
+	for i := range pod.Status.ContainerStatuses {
+		statuses[pod.Status.ContainerStatuses[i].Name] = &pod.Status.ContainerStatuses[i]
+	}
+	for i := range pod.Status.InitContainerStatuses {
+		statuses[pod.Status.InitContainerStatuses[i].Name] = &pod.Status.InitContainerStatuses[i]
+	}
+	for name, target := range targets {
+		status, ok := statuses[name]
+		if !ok || status.Resources == nil {
+			return false
+		}
+		if target.hasRequest {
+			actualReq, ok := status.Resources.Requests[corev1.ResourceCPU]
+			if !ok || actualReq.Cmp(target.request) != 0 {
+				return false
+			}
+		}
+		if target.hasLimit {
+			actualLim, ok := status.Resources.Limits[corev1.ResourceCPU]
+			if !ok || actualLim.Cmp(target.limit) != 0 {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+type podResizeStateSnapshot struct {
+	pendingTrue       bool
+	pendingReason     string
+	pendingMessage    string
+	inProgressTrue    bool
+	inProgressReason  string
+	inProgressMessage string
+	resizeStatus      corev1.PodResizeStatus
+	resizeApplied     bool
+}
+
+func getPodCondition(pod *corev1.Pod, condType corev1.PodConditionType) *corev1.PodCondition {
+	for i := range pod.Status.Conditions {
+		cond := &pod.Status.Conditions[i]
+		if cond.Type == condType {
+			return cond
+		}
+	}
+	return nil
+}
+
+func inspectPodResizeState(pod *corev1.Pod, targets map[string]containerCPUTarget) podResizeStateSnapshot {
+	pending := getPodCondition(pod, corev1.PodResizePending)
+	inProgress := getPodCondition(pod, corev1.PodResizeInProgress)
+
+	state := podResizeStateSnapshot{
+		resizeStatus:  pod.Status.Resize,
+		resizeApplied: isPodCPUResizeApplied(pod, targets),
+	}
+	if pending != nil && pending.Status == corev1.ConditionTrue {
+		state.pendingTrue = true
+		state.pendingReason = pending.Reason
+		state.pendingMessage = pending.Message
+	}
+	if inProgress != nil && inProgress.Status == corev1.ConditionTrue {
+		state.inProgressTrue = true
+		state.inProgressReason = inProgress.Reason
+		state.inProgressMessage = inProgress.Message
+	}
+	return state
+}
+
+func (s podResizeStateSnapshot) hasResizeSignal() bool {
+	return s.pendingTrue || s.inProgressTrue || s.resizeStatus != ""
+}
+
+func (s podResizeStateSnapshot) terminalError() error {
+	if s.pendingTrue && s.pendingReason == corev1.PodReasonInfeasible {
+		return fmt.Errorf("pod resize is infeasible: %s", s.pendingMessage)
+	}
+	if s.inProgressTrue && s.inProgressReason == corev1.PodReasonError {
+		return fmt.Errorf("pod resize has error: %s", s.inProgressMessage)
+	}
+	if s.resizeStatus == corev1.PodResizeStatusInfeasible {
+		return fmt.Errorf("pod resize is infeasible")
+	}
+	return nil
+}
+
+func (s podResizeStateSnapshot) isSettledWithoutDeferral() bool {
+	return !s.pendingTrue && !s.inProgressTrue && s.resizeStatus != corev1.PodResizeStatusDeferred
+}
+
+func shouldReturnOnCompleted(state podResizeStateSnapshot, sawResizeSignal bool) bool {
+	if state.resizeApplied {
+		return true
+	}
+	return sawResizeSignal && state.isSettledWithoutDeferral()
+}
+
+func waitForPodResizeState(ctx context.Context, client *clients.ClientSet, namespace, name string,
+	targetPod *corev1.Pod, timeout time.Duration) error {
+	log := klog.FromContext(ctx).WithValues("pod", klog.KRef(namespace, name))
+	if timeout <= 0 {
+		return nil
+	}
+	targets := buildContainerCPUTargets(targetPod)
+
+	sawResizeSignal := false
+	lastPendingReason := ""
+	lastPendingMessage := ""
+	err := wait.PollUntilContextTimeout(ctx, 200*time.Millisecond, timeout, true, func(ctx context.Context) (bool, error) {
+		pod, err := client.K8sClient.CoreV1().Pods(namespace).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return false, err
+		}
+		state := inspectPodResizeState(pod, targets)
+		if state.hasResizeSignal() {
+			sawResizeSignal = true
+		}
+		if state.pendingTrue {
+			lastPendingReason = state.pendingReason
+			lastPendingMessage = state.pendingMessage
+		}
+		if err := state.terminalError(); err != nil {
+			return false, err
+		}
+
+		return shouldReturnOnCompleted(state, sawResizeSignal), nil
+	})
+	if err != nil {
+		log.Error(err, "wait for pod resize state timeout")
+		if lastPendingReason != "" {
+			return fmt.Errorf("wait for pod resize state: %w (last pending reason=%s, message=%s)", err, lastPendingReason, lastPendingMessage)
+		}
+		return fmt.Errorf("wait for pod resize state: %w", err)
+	}
+	return nil
+}
+
+func TestWaitForPodResizeState(t *testing.T) {
+	targetPod := &corev1.Pod{
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{
+				{
+					Name: "main",
+					Resources: corev1.ResourceRequirements{
+						Requests: corev1.ResourceList{
+							corev1.ResourceCPU: resource.MustParse("500m"),
+						},
+						Limits: corev1.ResourceList{
+							corev1.ResourceCPU: resource.MustParse("1000m"),
+						},
+					},
+				},
+			},
+		},
+	}
+	tests := []struct {
+		name            string
+		conditions      []corev1.PodCondition
+		containerStatus []corev1.ContainerStatus
+		resizeStatus    corev1.PodResizeStatus
+		expectErr       string
+	}{
+		{
+			name: "infeasible should fail",
+			conditions: []corev1.PodCondition{
+				{
+					Type:    corev1.PodResizePending,
+					Status:  corev1.ConditionTrue,
+					Reason:  corev1.PodReasonInfeasible,
+					Message: "insufficient cpu",
+				},
+			},
+			expectErr: "infeasible",
+		},
+		{
+			name:       "completed resize",
+			conditions: nil,
+			containerStatus: []corev1.ContainerStatus{
+				{
+					Name: "main",
+					Resources: &corev1.ResourceRequirements{
+						Requests: corev1.ResourceList{
+							corev1.ResourceCPU: resource.MustParse("500m"),
+						},
+						Limits: corev1.ResourceList{
+							corev1.ResourceCPU: resource.MustParse("1000m"),
+						},
+					},
+				},
+			},
+			resizeStatus: "",
+		},
+		{
+			name:         "should not succeed without resize signal or applied status",
+			conditions:   nil,
+			resizeStatus: "",
+			expectErr:    "wait for pod resize state",
+		},
+		{
+			name: "deferred should timeout with pending reason",
+			conditions: []corev1.PodCondition{
+				{
+					Type:    corev1.PodResizePending,
+					Status:  corev1.ConditionTrue,
+					Reason:  corev1.PodReasonDeferred,
+					Message: "Node didn't have enough resource: cpu",
+				},
+			},
+			expectErr: "last pending reason=Deferred",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := clients.NewFakeClientSet(t)
+			pod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-pod",
+					Namespace: "default",
+				},
+				Status: corev1.PodStatus{
+					Conditions:        tt.conditions,
+					Resize:            tt.resizeStatus,
+					ContainerStatuses: tt.containerStatus,
+				},
+			}
+			createdPod, err := client.K8sClient.CoreV1().Pods("default").Create(t.Context(), pod, metav1.CreateOptions{})
+			require.NoError(t, err)
+			createdPod.Status = pod.Status
+			_, err = client.K8sClient.CoreV1().Pods("default").UpdateStatus(t.Context(), createdPod, metav1.UpdateOptions{})
+			require.NoError(t, err)
+
+			err = waitForPodResizeState(t.Context(), client, "default", "test-pod", targetPod, 500*time.Millisecond)
+			if tt.expectErr != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.expectErr)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+func KeepMakingAllSandboxesReady(ctx context.Context, client clients.SandboxClient) {
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			sandboxList, err := client.ApiV1alpha1().Sandboxes("default").List(context.Background(), metav1.ListOptions{})
+			if err != nil {
+				// Don't use require.NoError in goroutine - causes data race
+				continue
+			}
+			for _, sbx := range sandboxList.Items {
+				// Skip already ready sandboxes to reduce unnecessary updates
+				currentState, _ := sandboxutils.GetSandboxState(&sbx)
+				if currentState == v1alpha1.SandboxStateRunning {
+					continue
+				}
+
+				sbx.Status = v1alpha1.SandboxStatus{
+					Phase:              v1alpha1.SandboxRunning,
+					ObservedGeneration: sbx.Generation, // Important: sync generation
+					Conditions: []metav1.Condition{
+						{
+							Type:   string(v1alpha1.SandboxConditionReady),
+							Status: metav1.ConditionTrue,
+							Reason: v1alpha1.SandboxReadyReasonPodReady,
+						},
+					},
+					PodInfo: v1alpha1.PodInfo{
+						PodIP: "1.2.3.4",
+					},
+				}
+				updated, err := client.ApiV1alpha1().Sandboxes(sbx.Namespace).UpdateStatus(context.Background(), &sbx, metav1.UpdateOptions{})
+				if err != nil {
+					fmt.Printf("failed to update sandbox status: %v\n", err)
+					continue
+				}
+				// Record the expected version to help InplaceRefresh
+				if updated != nil {
+					utils.ResourceVersionExpectationExpect(updated)
+				}
+			}
+		}
 	}
 }
 

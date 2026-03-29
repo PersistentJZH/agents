@@ -17,6 +17,7 @@ limitations under the License.
 package v1alpha1
 
 import (
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -106,9 +107,31 @@ type SandboxClaimSpec struct {
 }
 
 type SandboxClaimInplaceUpdateOptions struct {
-	// Image specifies the new image to update to
-	// +kubebuilder:validation:Required
-	Image string `json:"image"`
+	// Image specifies the new image to update to.
+	// +optional
+	Image string `json:"image,omitempty"`
+
+	// Resources specifies in-place resource update options.
+	// +optional
+	Resources *SandboxClaimInplaceUpdateResourcesOptions `json:"resources,omitempty"`
+}
+
+// SandboxClaimInplaceUpdateResourcesOptions
+// TODO: now we only support cpu inplace resize, consider support mem resize in the future.
+type SandboxClaimInplaceUpdateResourcesOptions struct {
+	// Requests specifies the target resource requests for each container.
+	// Only CPU is supported for now. The container's original request must already be set;
+	// otherwise the value is ignored.
+	// The new value must not change the Pod's QoS class; otherwise the claim will be rejected.
+	// +optional
+	Requests corev1.ResourceList `json:"requests,omitempty"`
+
+	// Limits specifies the target resource limits for each container.
+	// Only CPU is supported for now. The container's original limit must already be set;
+	// otherwise the value is ignored.
+	// The new value must not change the Pod's QoS class; otherwise the claim will be rejected.
+	// +optional
+	Limits corev1.ResourceList `json:"limits,omitempty"`
 }
 
 // SandboxClaimStatus defines the observed state of SandboxClaim

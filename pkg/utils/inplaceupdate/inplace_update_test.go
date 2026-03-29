@@ -16,10 +16,12 @@ package inplaceupdate
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -366,7 +368,7 @@ func TestIsInplaceUpdateCompleted(t *testing.T) {
 					Name:      "test-pod",
 					Namespace: "default",
 					Annotations: map[string]string{
-						PodAnnotationInPlaceUpdateStateKey: `{"revision":"abc123","updateTimestamp":"2023-01-01T00:00:00Z","lastContainerStatuses":{"container1":{"imageID":"image123"}}}`,
+						PodAnnotationInPlaceUpdateStateKey: `{"revision":"abc123","updateTimestamp":"2023-01-01T00:00:00Z","updateImages":true,"lastContainerStatuses":{"container1":{"imageID":"image123"}}}`,
 					},
 				},
 				Status: corev1.PodStatus{
@@ -387,7 +389,7 @@ func TestIsInplaceUpdateCompleted(t *testing.T) {
 					Name:      "test-pod",
 					Namespace: "default",
 					Annotations: map[string]string{
-						PodAnnotationInPlaceUpdateStateKey: `{"revision":"abc123","updateTimestamp":"2023-01-01T00:00:00Z","lastContainerStatuses":{"container1":{"imageID":"image123"}}}`,
+						PodAnnotationInPlaceUpdateStateKey: `{"revision":"abc123","updateTimestamp":"2023-01-01T00:00:00Z","updateImages":true,"lastContainerStatuses":{"container1":{"imageID":"image123"}}}`,
 					},
 				},
 				Status: corev1.PodStatus{
@@ -408,7 +410,7 @@ func TestIsInplaceUpdateCompleted(t *testing.T) {
 					Name:      "test-pod",
 					Namespace: "default",
 					Annotations: map[string]string{
-						PodAnnotationInPlaceUpdateStateKey: `{"revision":"abc123","updateTimestamp":"2023-01-01T00:00:00Z","lastContainerStatuses":{"container1":{"imageID":"image123"}}}`,
+						PodAnnotationInPlaceUpdateStateKey: `{"revision":"abc123","updateTimestamp":"2023-01-01T00:00:00Z","updateImages":true,"lastContainerStatuses":{"container1":{"imageID":"image123"}}}`,
 					},
 				},
 				Status: corev1.PodStatus{
@@ -434,719 +436,384 @@ func TestIsInplaceUpdateCompleted(t *testing.T) {
 	}
 }
 
-func TestDefaultGeneratePatchBodyFunc(t *testing.T) {
+func TestResourceOnlyUpdatePayloads(t *testing.T) {
+	opts := InPlaceUpdateOptions{
+		Box: &agentsapiv1alpha1.Sandbox{
+			Spec: agentsapiv1alpha1.SandboxSpec{
+				EmbeddedSandboxTemplate: agentsapiv1alpha1.EmbeddedSandboxTemplate{
+					Template: &corev1.PodTemplateSpec{
+						Spec: corev1.PodSpec{
+							Containers: []corev1.Container{
+								{
+									Name:  "main",
+									Image: "busybox:1.36",
+									Resources: corev1.ResourceRequirements{
+										Requests: corev1.ResourceList{
+											corev1.ResourceCPU: resource.MustParse("1000m"),
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		Pod: &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "p1",
+				Namespace: "default",
+			},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{
+					{
+						Name:  "main",
+						Image: "busybox:1.36",
+						Resources: corev1.ResourceRequirements{
+							Requests: corev1.ResourceList{
+								corev1.ResourceCPU: resource.MustParse("500m"),
+							},
+						},
+					},
+				},
+			},
+		},
+		Revision: "rev-resource-only",
+	}
+
+	patchBody := DefaultGeneratePatchBodyFunc(opts)
+	if patchBody == "" {
+		t.Fatalf("expected patch body for resource-only update")
+	}
+	if strings.Contains(patchBody, `"spec"`) {
+		t.Fatalf("resource-only patch should not contain spec, got: %s", patchBody)
+	}
+
+	resizeBody := DefaultGenerateResizeSubresourceBody(opts)
+	if resizeBody == nil {
+		t.Fatalf("expected resize subresource body")
+	}
+	got := resizeBody.Spec.Containers[0].Resources.Requests[corev1.ResourceCPU]
+	if got.MilliValue() != 1000 {
+		t.Fatalf("expected cpu request=1000m, got=%dm", got.MilliValue())
+	}
+}
+
+func TestIsInplaceUpdateCompletedWithResourceConditions(t *testing.T) {
+	state := &InPlaceUpdateState{
+		Revision:        "rev-1",
+		UpdateTimestamp: metav1.Now(),
+		UpdateResources: true,
+	}
+	raw, err := json.Marshal(state)
+	if err != nil {
+		t.Fatalf("marshal state failed: %v", err)
+	}
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "p1",
+			Namespace: "default",
+			Annotations: map[string]string{
+				PodAnnotationInPlaceUpdateStateKey: string(raw),
+			},
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{
+				{
+					Name: "main",
+					Resources: corev1.ResourceRequirements{
+						Requests: corev1.ResourceList{
+							corev1.ResourceCPU: resource.MustParse("1000m"),
+						},
+					},
+				},
+			},
+		},
+		Status: corev1.PodStatus{
+			Conditions: []corev1.PodCondition{
+				{
+					Type:   corev1.PodResizeInProgress,
+					Status: corev1.ConditionTrue,
+				},
+			},
+		},
+	}
+
+	if IsInplaceUpdateCompleted(context.Background(), pod) {
+		t.Fatalf("expected incomplete while PodResizeInProgress is true")
+	}
+
+	pod.Status.Conditions = nil
+	if IsInplaceUpdateCompleted(context.Background(), pod) {
+		t.Fatalf("expected incomplete when no resize signal and no applied resources")
+	}
+
+	pod.Status.Resize = corev1.PodResizeStatusInProgress
+	if IsInplaceUpdateCompleted(context.Background(), pod) {
+		t.Fatalf("expected incomplete while resize status is in progress")
+	}
+
+	pod.Status.Resize = ""
+	pod.Status.Conditions = []corev1.PodCondition{
+		{
+			Type:   corev1.PodResizeInProgress,
+			Status: corev1.ConditionFalse,
+		},
+	}
+	if IsInplaceUpdateCompleted(context.Background(), pod) {
+		t.Fatalf("expected incomplete when only resize signals exist but resources not applied")
+	}
+
+	pod.Status.Resize = ""
+	pod.Status.Conditions = nil
+	pod.Status.ContainerStatuses = []corev1.ContainerStatus{
+		{
+			Name: "main",
+			Resources: &corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceCPU: resource.MustParse("1000m"),
+				},
+			},
+		},
+	}
+	if !IsInplaceUpdateCompleted(context.Background(), pod) {
+		t.Fatalf("expected completed when resources are applied to container status")
+	}
+}
+
+func TestCheckResizeQoSChange(t *testing.T) {
 	tests := []struct {
-		name           string
-		opts           InPlaceUpdateOptions
-		expectedEmpty  bool
-		checkPatchBody func(t *testing.T, patchBody string)
+		name        string
+		box         *agentsapiv1alpha1.Sandbox
+		pod         *corev1.Pod
+		wantOrig    corev1.PodQOSClass
+		wantUpdated corev1.PodQOSClass
+		wantChanged bool
 	}{
 		{
-			name: "no container changes - same image",
-			opts: InPlaceUpdateOptions{
-				Box: &agentsapiv1alpha1.Sandbox{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      "test-sandbox",
-						Namespace: "default",
-					},
-					Spec: agentsapiv1alpha1.SandboxSpec{
-						EmbeddedSandboxTemplate: agentsapiv1alpha1.EmbeddedSandboxTemplate{
-							Template: &corev1.PodTemplateSpec{
-								Spec: corev1.PodSpec{
-									Containers: []corev1.Container{
-										{
-											Name:  "container1",
-											Image: "nginx:latest",
+			name: "no QoS change - Burstable stays Burstable",
+			box: &agentsapiv1alpha1.Sandbox{
+				Spec: agentsapiv1alpha1.SandboxSpec{
+					EmbeddedSandboxTemplate: agentsapiv1alpha1.EmbeddedSandboxTemplate{
+						Template: &corev1.PodTemplateSpec{
+							Spec: corev1.PodSpec{
+								Containers: []corev1.Container{{
+									Name: "main",
+									Resources: corev1.ResourceRequirements{
+										Requests: corev1.ResourceList{
+											corev1.ResourceCPU:    resource.MustParse("500m"),
+											corev1.ResourceMemory: resource.MustParse("128Mi"),
+										},
+										Limits: corev1.ResourceList{
+											corev1.ResourceCPU:    resource.MustParse("1"),
+											corev1.ResourceMemory: resource.MustParse("256Mi"),
 										},
 									},
-								},
+								}},
 							},
 						},
 					},
 				},
-				Pod: &corev1.Pod{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      "test-pod",
-						Namespace: "default",
-					},
-					Spec: corev1.PodSpec{
-						Containers: []corev1.Container{
-							{
-								Name:  "container1",
-								Image: "nginx:latest", // Same image
+			},
+			pod: &corev1.Pod{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{
+						Name: "main",
+						Resources: corev1.ResourceRequirements{
+							Requests: corev1.ResourceList{
+								corev1.ResourceCPU:    resource.MustParse("250m"),
+								corev1.ResourceMemory: resource.MustParse("128Mi"),
+							},
+							Limits: corev1.ResourceList{
+								corev1.ResourceCPU:    resource.MustParse("500m"),
+								corev1.ResourceMemory: resource.MustParse("256Mi"),
 							},
 						},
-					},
-					Status: corev1.PodStatus{
-						ContainerStatuses: []corev1.ContainerStatus{
-							{
-								Name:    "container1",
-								ImageID: "docker.io/nginx:latest@sha256:abc123",
-							},
-						},
-					},
+					}},
 				},
-				Revision: "rev-001",
 			},
-			expectedEmpty: false,
-			checkPatchBody: func(t *testing.T, patchBody string) {
-				var patch map[string]interface{}
-				if err := json.Unmarshal([]byte(patchBody), &patch); err != nil {
-					t.Fatalf("Failed to unmarshal patch body: %v", err)
-				}
-
-				metadata, ok := patch["metadata"].(map[string]interface{})
-				if !ok {
-					t.Fatalf("Patch body should have metadata")
-				}
-
-				labels, ok := metadata["labels"].(map[string]interface{})
-				if !ok {
-					t.Fatalf("Metadata should have labels")
-				}
-
-				if labels[agentsapiv1alpha1.PodLabelTemplateHash] != "rev-001" {
-					t.Errorf("Expected label pod-template-hash=rev-001, got %v", labels[agentsapiv1alpha1.PodLabelTemplateHash])
-				}
-
-				annotations, ok := metadata["annotations"].(map[string]interface{})
-				if !ok {
-					t.Fatalf("Metadata should have annotations")
-				}
-
-				stateStr, ok := annotations[PodAnnotationInPlaceUpdateStateKey].(string)
-				if !ok {
-					t.Fatalf("Annotations should have inplace update state")
-				}
-
-				var state InPlaceUpdateState
-				if err := json.Unmarshal([]byte(stateStr), &state); err != nil {
-					t.Fatalf("Failed to unmarshal state: %v", err)
-				}
-
-				if state.Revision != "rev-001" {
-					t.Errorf("Expected revision rev-001, got %s", state.Revision)
-				}
-
-				if state.UpdateImages {
-					t.Errorf("Expected UpdateImages to be false (no container changes)")
-				}
-
-				if len(state.LastContainerStatuses) != 0 {
-					t.Errorf("Expected empty LastContainerStatuses, got %d entries", len(state.LastContainerStatuses))
-				}
-
-				spec, ok := patch["spec"].(map[string]interface{})
-				if !ok {
-					t.Fatalf("Patch body should have spec")
-				}
-
-				containers, _ := spec["containers"].([]interface{})
-				if len(containers) != 0 {
-					t.Errorf("Expected empty containers array (no changes), got %v", containers)
-				}
-			},
+			wantOrig:    corev1.PodQOSBurstable,
+			wantUpdated: corev1.PodQOSBurstable,
+			wantChanged: false,
 		},
 		{
-			name: "single container image change",
-			opts: InPlaceUpdateOptions{
-				Box: &agentsapiv1alpha1.Sandbox{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      "test-sandbox",
-						Namespace: "default",
-					},
-					Spec: agentsapiv1alpha1.SandboxSpec{
-						EmbeddedSandboxTemplate: agentsapiv1alpha1.EmbeddedSandboxTemplate{
-							Template: &corev1.PodTemplateSpec{
-								Spec: corev1.PodSpec{
-									Containers: []corev1.Container{
-										{
-											Name:  "container1",
-											Image: "nginx:1.20", // New image
+			name: "QoS changes from Burstable to Guaranteed",
+			box: &agentsapiv1alpha1.Sandbox{
+				Spec: agentsapiv1alpha1.SandboxSpec{
+					EmbeddedSandboxTemplate: agentsapiv1alpha1.EmbeddedSandboxTemplate{
+						Template: &corev1.PodTemplateSpec{
+							Spec: corev1.PodSpec{
+								Containers: []corev1.Container{{
+									Name: "main",
+									Resources: corev1.ResourceRequirements{
+										Requests: corev1.ResourceList{
+											corev1.ResourceCPU:    resource.MustParse("500m"),
+											corev1.ResourceMemory: resource.MustParse("128Mi"),
+										},
+										Limits: corev1.ResourceList{
+											corev1.ResourceCPU:    resource.MustParse("500m"),
+											corev1.ResourceMemory: resource.MustParse("128Mi"),
 										},
 									},
-								},
+								}},
 							},
 						},
 					},
 				},
-				Pod: &corev1.Pod{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      "test-pod",
-						Namespace: "default",
-					},
-					Spec: corev1.PodSpec{
-						Containers: []corev1.Container{
-							{
-								Name:  "container1",
-								Image: "nginx:latest", // Old image
+			},
+			pod: &corev1.Pod{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{
+						Name: "main",
+						Resources: corev1.ResourceRequirements{
+							Requests: corev1.ResourceList{
+								corev1.ResourceCPU:    resource.MustParse("250m"),
+								corev1.ResourceMemory: resource.MustParse("128Mi"),
+							},
+							Limits: corev1.ResourceList{
+								corev1.ResourceCPU:    resource.MustParse("500m"),
+								corev1.ResourceMemory: resource.MustParse("128Mi"),
 							},
 						},
-					},
-					Status: corev1.PodStatus{
-						ContainerStatuses: []corev1.ContainerStatus{
-							{
-								Name:    "container1",
-								ImageID: "docker.io/nginx:latest@sha256:old123",
-							},
-						},
-					},
+					}},
 				},
-				Revision: "rev-002",
 			},
-			expectedEmpty: false,
-			checkPatchBody: func(t *testing.T, patchBody string) {
-				// Verify patch body contains expected elements
-				if !containsString(patchBody, `"containers"`) {
-					t.Errorf("Patch body should contain containers")
-				}
-				if !containsString(patchBody, `"nginx:1.20"`) {
-					t.Errorf("Patch body should contain new image nginx:1.20")
-				}
-				if !containsString(patchBody, `\"revision\":\"rev-002\"`) {
-					t.Errorf("Patch body should contain revision rev-002")
-				}
-
-				// Parse and validate the state annotation
-				var patch map[string]interface{}
-				if err := json.Unmarshal([]byte(patchBody), &patch); err != nil {
-					t.Fatalf("Failed to unmarshal patch body: %v", err)
-				}
-
-				metadata, ok := patch["metadata"].(map[string]interface{})
-				if !ok {
-					t.Fatalf("Patch body should have metadata")
-				}
-
-				annotations, ok := metadata["annotations"].(map[string]interface{})
-				if !ok {
-					t.Fatalf("Metadata should have annotations")
-				}
-
-				stateStr, ok := annotations[PodAnnotationInPlaceUpdateStateKey].(string)
-				if !ok {
-					t.Fatalf("Annotations should have inplace update state")
-				}
-
-				var state InPlaceUpdateState
-				if err := json.Unmarshal([]byte(stateStr), &state); err != nil {
-					t.Fatalf("Failed to unmarshal state: %v", err)
-				}
-
-				if state.Revision != "rev-002" {
-					t.Errorf("Expected revision rev-002, got %s", state.Revision)
-				}
-
-				if !state.UpdateImages {
-					t.Errorf("Expected UpdateImages to be true")
-				}
-
-				if len(state.LastContainerStatuses) != 1 {
-					t.Fatalf("Expected 1 container status, got %d", len(state.LastContainerStatuses))
-				}
-
-				containerStatus, exists := state.LastContainerStatuses["container1"]
-				if !exists {
-					t.Fatalf("Expected container1 in LastContainerStatuses")
-				}
-
-				if containerStatus.ImageID != "docker.io/nginx:latest@sha256:old123" {
-					t.Errorf("Expected old image ID, got %s", containerStatus.ImageID)
-				}
-			},
+			wantOrig:    corev1.PodQOSBurstable,
+			wantUpdated: corev1.PodQOSGuaranteed,
+			wantChanged: true,
 		},
 		{
-			name: "multiple container image changes",
-			opts: InPlaceUpdateOptions{
-				Box: &agentsapiv1alpha1.Sandbox{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      "test-sandbox",
-						Namespace: "default",
-					},
-					Spec: agentsapiv1alpha1.SandboxSpec{
-						EmbeddedSandboxTemplate: agentsapiv1alpha1.EmbeddedSandboxTemplate{
-							Template: &corev1.PodTemplateSpec{
-								Spec: corev1.PodSpec{
-									Containers: []corev1.Container{
-										{
-											Name:  "app",
-											Image: "myapp:v2",
-										},
-										{
-											Name:  "sidecar",
-											Image: "envoy:v1.2",
-										},
-									},
-								},
-							},
-						},
-					},
-				},
-				Pod: &corev1.Pod{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      "test-pod",
-						Namespace: "default",
-					},
-					Spec: corev1.PodSpec{
-						Containers: []corev1.Container{
-							{
-								Name:  "app",
-								Image: "myapp:v1",
-							},
-							{
-								Name:  "sidecar",
-								Image: "envoy:v1.1",
-							},
-						},
-					},
-					Status: corev1.PodStatus{
-						ContainerStatuses: []corev1.ContainerStatus{
-							{
-								Name:    "app",
-								ImageID: "myapp:v1@sha256:aaa",
-							},
-							{
-								Name:    "sidecar",
-								ImageID: "envoy:v1.1@sha256:bbb",
-							},
-						},
-					},
-				},
-				Revision: "rev-multi",
+			name: "nil template - no change",
+			box: &agentsapiv1alpha1.Sandbox{
+				Spec: agentsapiv1alpha1.SandboxSpec{},
 			},
-			expectedEmpty: false,
-			checkPatchBody: func(t *testing.T, patchBody string) {
-				if !containsString(patchBody, `"myapp:v2"`) {
-					t.Errorf("Patch body should contain myapp:v2")
-				}
-				if !containsString(patchBody, `"envoy:v1.2"`) {
-					t.Errorf("Patch body should contain envoy:v1.2")
-				}
-
-				var patch map[string]interface{}
-				if err := json.Unmarshal([]byte(patchBody), &patch); err != nil {
-					t.Fatalf("Failed to unmarshal patch body: %v", err)
-				}
-
-				metadata := patch["metadata"].(map[string]interface{})
-				annotations := metadata["annotations"].(map[string]interface{})
-				stateStr := annotations[PodAnnotationInPlaceUpdateStateKey].(string)
-
-				var state InPlaceUpdateState
-				if err := json.Unmarshal([]byte(stateStr), &state); err != nil {
-					t.Fatalf("Failed to unmarshal state: %v", err)
-				}
-
-				if len(state.LastContainerStatuses) != 2 {
-					t.Fatalf("Expected 2 container statuses, got %d", len(state.LastContainerStatuses))
-				}
-
-				if _, exists := state.LastContainerStatuses["app"]; !exists {
-					t.Errorf("Expected app in LastContainerStatuses")
-				}
-				if _, exists := state.LastContainerStatuses["sidecar"]; !exists {
-					t.Errorf("Expected sidecar in LastContainerStatuses")
-				}
-			},
-		},
-		{
-			name: "partial container changes - only some images changed",
-			opts: InPlaceUpdateOptions{
-				Box: &agentsapiv1alpha1.Sandbox{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      "test-sandbox",
-						Namespace: "default",
-					},
-					Spec: agentsapiv1alpha1.SandboxSpec{
-						EmbeddedSandboxTemplate: agentsapiv1alpha1.EmbeddedSandboxTemplate{
-							Template: &corev1.PodTemplateSpec{
-								Spec: corev1.PodSpec{
-									Containers: []corev1.Container{
-										{
-											Name:  "container1",
-											Image: "nginx:1.20", // Changed
-										},
-										{
-											Name:  "container2",
-											Image: "redis:7.0", // Unchanged
-										},
-									},
-								},
-							},
+			pod: &corev1.Pod{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{
+						Name: "main",
+						Resources: corev1.ResourceRequirements{
+							Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("100m")},
 						},
-					},
+					}},
 				},
-				Pod: &corev1.Pod{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      "test-pod",
-						Namespace: "default",
-					},
-					Spec: corev1.PodSpec{
-						Containers: []corev1.Container{
-							{
-								Name:  "container1",
-								Image: "nginx:latest",
-							},
-							{
-								Name:  "container2",
-								Image: "redis:7.0", // Same
-							},
-						},
-					},
-					Status: corev1.PodStatus{
-						ContainerStatuses: []corev1.ContainerStatus{
-							{
-								Name:    "container1",
-								ImageID: "nginx:latest@sha256:old",
-							},
-							{
-								Name:    "container2",
-								ImageID: "redis:7.0@sha256:same",
-							},
-						},
-					},
-				},
-				Revision: "rev-partial",
 			},
-			expectedEmpty: false,
-			checkPatchBody: func(t *testing.T, patchBody string) {
-				// Should only patch container1
-				if containsString(patchBody, `"redis:7.0"`) {
-					t.Errorf("Patch body should not contain unchanged redis:7.0")
-				}
-				if !containsString(patchBody, `"nginx:1.20"`) {
-					t.Errorf("Patch body should contain nginx:1.20")
-				}
-
-				var patch map[string]interface{}
-				if err := json.Unmarshal([]byte(patchBody), &patch); err != nil {
-					t.Fatalf("Failed to unmarshal patch body: %v", err)
-				}
-
-				metadata := patch["metadata"].(map[string]interface{})
-				annotations := metadata["annotations"].(map[string]interface{})
-				stateStr := annotations[PodAnnotationInPlaceUpdateStateKey].(string)
-
-				var state InPlaceUpdateState
-				if err := json.Unmarshal([]byte(stateStr), &state); err != nil {
-					t.Fatalf("Failed to unmarshal state: %v", err)
-				}
-
-				// Should only track container1
-				if len(state.LastContainerStatuses) != 1 {
-					t.Fatalf("Expected 1 container status, got %d", len(state.LastContainerStatuses))
-				}
-				if _, exists := state.LastContainerStatuses["container1"]; !exists {
-					t.Errorf("Expected container1 in LastContainerStatuses")
-				}
-			},
-		},
-		{
-			name: "propagate labels from sandbox template to pod",
-			opts: InPlaceUpdateOptions{
-				Box: &agentsapiv1alpha1.Sandbox{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      "test-sandbox",
-						Namespace: "default",
-					},
-					Spec: agentsapiv1alpha1.SandboxSpec{
-						EmbeddedSandboxTemplate: agentsapiv1alpha1.EmbeddedSandboxTemplate{
-							Template: &corev1.PodTemplateSpec{
-								ObjectMeta: metav1.ObjectMeta{
-									Labels: map[string]string{
-										"app":     "myapp",
-										"version": "v2",
-										"team":    "platform",
-									},
-								},
-								Spec: corev1.PodSpec{
-									Containers: []corev1.Container{
-										{
-											Name:  "container1",
-											Image: "nginx:1.20",
-										},
-									},
-								},
-							},
-						},
-					},
-				},
-				Pod: &corev1.Pod{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      "test-pod",
-						Namespace: "default",
-						Labels: map[string]string{
-							"app":               "myapp",
-							"version":           "v1", // Different version
-							"pod-template-hash": "old-hash",
-						},
-					},
-					Spec: corev1.PodSpec{
-						Containers: []corev1.Container{
-							{
-								Name:  "container1",
-								Image: "nginx:latest",
-							},
-						},
-					},
-					Status: corev1.PodStatus{
-						ContainerStatuses: []corev1.ContainerStatus{
-							{
-								Name:    "container1",
-								ImageID: "nginx:latest@sha256:old",
-							},
-						},
-					},
-				},
-				Revision: "rev-labels",
-			},
-			expectedEmpty: false,
-			checkPatchBody: func(t *testing.T, patchBody string) {
-				var patch map[string]interface{}
-				if err := json.Unmarshal([]byte(patchBody), &patch); err != nil {
-					t.Fatalf("Failed to unmarshal patch body: %v", err)
-				}
-
-				metadata := patch["metadata"].(map[string]interface{})
-				labels := metadata["labels"].(map[string]interface{})
-
-				// Check that labels are propagated
-				if labels["version"] != "v2" {
-					t.Errorf("Expected label version=v2, got %v", labels["version"])
-				}
-				if labels["team"] != "platform" {
-					t.Errorf("Expected label team=platform, got %v", labels["team"])
-				}
-				// Check pod-template-hash is updated
-				if labels["pod-template-hash"] != "rev-labels" {
-					t.Errorf("Expected pod-template-hash=rev-labels, got %v", labels["pod-template-hash"])
-				}
-			},
-		},
-		{
-			name: "container in pod but not in sandbox template - skip it",
-			opts: InPlaceUpdateOptions{
-				Box: &agentsapiv1alpha1.Sandbox{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      "test-sandbox",
-						Namespace: "default",
-					},
-					Spec: agentsapiv1alpha1.SandboxSpec{
-						EmbeddedSandboxTemplate: agentsapiv1alpha1.EmbeddedSandboxTemplate{
-							Template: &corev1.PodTemplateSpec{
-								Spec: corev1.PodSpec{
-									Containers: []corev1.Container{
-										{
-											Name:  "container1",
-											Image: "nginx:1.20",
-										},
-									},
-								},
-							},
-						},
-					},
-				},
-				Pod: &corev1.Pod{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      "test-pod",
-						Namespace: "default",
-					},
-					Spec: corev1.PodSpec{
-						Containers: []corev1.Container{
-							{
-								Name:  "container1",
-								Image: "nginx:latest",
-							},
-							{
-								Name:  "extra-container", // Not in sandbox template
-								Image: "redis:latest",
-							},
-						},
-					},
-					Status: corev1.PodStatus{
-						ContainerStatuses: []corev1.ContainerStatus{
-							{
-								Name:    "container1",
-								ImageID: "nginx:latest@sha256:old",
-							},
-							{
-								Name:    "extra-container",
-								ImageID: "redis:latest@sha256:extra",
-							},
-						},
-					},
-				},
-				Revision: "rev-extra",
-			},
-			expectedEmpty: false,
-			checkPatchBody: func(t *testing.T, patchBody string) {
-				// Should only patch container1, not extra-container
-				if containsString(patchBody, `"redis"`) {
-					t.Errorf("Patch body should not contain extra-container redis")
-				}
-				if !containsString(patchBody, `"nginx:1.20"`) {
-					t.Errorf("Patch body should contain nginx:1.20")
-				}
-
-				var patch map[string]interface{}
-				if err := json.Unmarshal([]byte(patchBody), &patch); err != nil {
-					t.Fatalf("Failed to unmarshal patch body: %v", err)
-				}
-
-				metadata := patch["metadata"].(map[string]interface{})
-				annotations := metadata["annotations"].(map[string]interface{})
-				stateStr := annotations[PodAnnotationInPlaceUpdateStateKey].(string)
-
-				var state InPlaceUpdateState
-				if err := json.Unmarshal([]byte(stateStr), &state); err != nil {
-					t.Fatalf("Failed to unmarshal state: %v", err)
-				}
-
-				// Should only track container1
-				if len(state.LastContainerStatuses) != 1 {
-					t.Fatalf("Expected 1 container status, got %d", len(state.LastContainerStatuses))
-				}
-				if _, exists := state.LastContainerStatuses["extra-container"]; exists {
-					t.Errorf("Should not track extra-container in LastContainerStatuses")
-				}
-			},
-		},
-		{
-			name: "empty sandbox template - generate metadata only",
-			opts: InPlaceUpdateOptions{
-				Box: &agentsapiv1alpha1.Sandbox{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      "test-sandbox",
-						Namespace: "default",
-					},
-					Spec: agentsapiv1alpha1.SandboxSpec{
-						EmbeddedSandboxTemplate: agentsapiv1alpha1.EmbeddedSandboxTemplate{
-							Template: &corev1.PodTemplateSpec{
-								Spec: corev1.PodSpec{
-									Containers: []corev1.Container{},
-								},
-							},
-						},
-					},
-				},
-				Pod: &corev1.Pod{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      "test-pod",
-						Namespace: "default",
-					},
-					Spec: corev1.PodSpec{
-						Containers: []corev1.Container{
-							{
-								Name:  "container1",
-								Image: "nginx:latest",
-							},
-						},
-					},
-				},
-				Revision: "rev-empty",
-			},
-			expectedEmpty: false,
-			checkPatchBody: func(t *testing.T, patchBody string) {
-				var patch map[string]interface{}
-				if err := json.Unmarshal([]byte(patchBody), &patch); err != nil {
-					t.Fatalf("Failed to unmarshal patch body: %v", err)
-				}
-
-				metadata, ok := patch["metadata"].(map[string]interface{})
-				if !ok {
-					t.Fatalf("Patch body should have metadata")
-				}
-
-				labels, ok := metadata["labels"].(map[string]interface{})
-				if !ok {
-					t.Fatalf("Metadata should have labels")
-				}
-
-				if labels[agentsapiv1alpha1.PodLabelTemplateHash] != "rev-empty" {
-					t.Errorf("Expected label pod-template-hash=rev-empty, got %v", labels[agentsapiv1alpha1.PodLabelTemplateHash])
-				}
-
-				annotations, ok := metadata["annotations"].(map[string]interface{})
-				if !ok {
-					t.Fatalf("Metadata should have annotations")
-				}
-
-				stateStr, ok := annotations[PodAnnotationInPlaceUpdateStateKey].(string)
-				if !ok {
-					t.Fatalf("Annotations should have inplace update state")
-				}
-
-				var state InPlaceUpdateState
-				if err := json.Unmarshal([]byte(stateStr), &state); err != nil {
-					t.Fatalf("Failed to unmarshal state: %v", err)
-				}
-
-				if state.Revision != "rev-empty" {
-					t.Errorf("Expected revision rev-empty, got %s", state.Revision)
-				}
-
-				if state.UpdateImages {
-					t.Errorf("Expected UpdateImages to be false (no containers in sandbox template)")
-				}
-
-				if len(state.LastContainerStatuses) != 0 {
-					t.Errorf("Expected empty LastContainerStatuses, got %d entries", len(state.LastContainerStatuses))
-				}
-
-				spec, ok := patch["spec"].(map[string]interface{})
-				if !ok {
-					t.Fatalf("Patch body should have spec")
-				}
-
-				containers, _ := spec["containers"].([]interface{})
-				if len(containers) != 0 {
-					t.Errorf("Expected empty containers array (sandbox has no containers), got %v", containers)
-				}
-			},
+			wantChanged: false,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			patchBody := DefaultGeneratePatchBodyFunc(tt.opts)
-
-			if tt.expectedEmpty {
-				if patchBody != "" {
-					t.Errorf("Expected empty patch body, got: %s", patchBody)
+			orig, updated, changed := CheckResizeQoSChange(tt.box, tt.pod)
+			if changed != tt.wantChanged {
+				t.Errorf("changed = %v, want %v", changed, tt.wantChanged)
+			}
+			if tt.wantChanged {
+				if orig != tt.wantOrig {
+					t.Errorf("orig = %v, want %v", orig, tt.wantOrig)
 				}
-				return
-			}
-
-			if patchBody == "" {
-				t.Fatalf("Expected non-empty patch body, got empty string")
-			}
-
-			// Validate JSON format
-			var parsed interface{}
-			if err := json.Unmarshal([]byte(patchBody), &parsed); err != nil {
-				t.Fatalf("Patch body is not valid JSON: %v\nBody: %s", err, patchBody)
-			}
-
-			// Run custom checks if provided
-			if tt.checkPatchBody != nil {
-				tt.checkPatchBody(t, patchBody)
+				if updated != tt.wantUpdated {
+					t.Errorf("updated = %v, want %v", updated, tt.wantUpdated)
+				}
 			}
 		})
 	}
 }
 
-// Helper function to check if a string contains a substring
-func containsString(s, substr string) bool {
-	return len(s) >= len(substr) && (s == substr || len(s) > len(substr) &&
-		(s[:len(substr)] == substr || s[len(s)-len(substr):] == substr ||
-			findSubstring(s, substr)))
-}
-
-func findSubstring(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
+func TestComputeQoSClass(t *testing.T) {
+	tests := []struct {
+		name string
+		pod  *corev1.Pod
+		want corev1.PodQOSClass
+	}{
+		{
+			name: "guaranteed",
+			pod: &corev1.Pod{Spec: corev1.PodSpec{Containers: []corev1.Container{{
+				Resources: corev1.ResourceRequirements{
+					Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1"), corev1.ResourceMemory: resource.MustParse("1Gi")},
+					Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1"), corev1.ResourceMemory: resource.MustParse("1Gi")},
+				},
+			}}}},
+			want: corev1.PodQOSGuaranteed,
+		},
+		{
+			name: "burstable - only requests",
+			pod: &corev1.Pod{Spec: corev1.PodSpec{Containers: []corev1.Container{{
+				Resources: corev1.ResourceRequirements{
+					Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("100m")},
+				},
+			}}}},
+			want: corev1.PodQOSBurstable,
+		},
+		{
+			name: "best effort",
+			pod:  &corev1.Pod{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "c"}}}},
+			want: corev1.PodQOSBestEffort,
+		},
+		{
+			name: "pod-level resources - guaranteed",
+			pod: &corev1.Pod{Spec: corev1.PodSpec{
+				Resources: &corev1.ResourceRequirements{
+					Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2"), corev1.ResourceMemory: resource.MustParse("4Gi")},
+					Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2"), corev1.ResourceMemory: resource.MustParse("4Gi")},
+				},
+				Containers: []corev1.Container{{Name: "c"}},
+			}},
+			want: corev1.PodQOSGuaranteed,
+		},
+		{
+			name: "pod-level resources - burstable (limits != requests)",
+			pod: &corev1.Pod{Spec: corev1.PodSpec{
+				Resources: &corev1.ResourceRequirements{
+					Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1"), corev1.ResourceMemory: resource.MustParse("2Gi")},
+					Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2"), corev1.ResourceMemory: resource.MustParse("4Gi")},
+				},
+				Containers: []corev1.Container{{Name: "c"}},
+			}},
+			want: corev1.PodQOSBurstable,
+		},
+		{
+			name: "pod-level resources - burstable (only cpu limits)",
+			pod: &corev1.Pod{Spec: corev1.PodSpec{
+				Resources: &corev1.ResourceRequirements{
+					Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1")},
+					Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1")},
+				},
+				Containers: []corev1.Container{{Name: "c"}},
+			}},
+			want: corev1.PodQOSBurstable,
+		},
+		{
+			name: "pod-level resources take precedence over container resources",
+			pod: &corev1.Pod{Spec: corev1.PodSpec{
+				Resources: &corev1.ResourceRequirements{
+					Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1"), corev1.ResourceMemory: resource.MustParse("1Gi")},
+					Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1"), corev1.ResourceMemory: resource.MustParse("1Gi")},
+				},
+				Containers: []corev1.Container{{
+					Name: "c",
+					Resources: corev1.ResourceRequirements{
+						Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("100m")},
+					},
+				}},
+			}},
+			want: corev1.PodQOSGuaranteed,
+		},
+		{
+			name: "pod-level resources - best effort (empty)",
+			pod: &corev1.Pod{Spec: corev1.PodSpec{
+				Resources:  &corev1.ResourceRequirements{},
+				Containers: []corev1.Container{{Name: "c"}},
+			}},
+			want: corev1.PodQOSBestEffort,
+		},
 	}
-	return false
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := computeQoSClass(tt.pod)
+			if got != tt.want {
+				t.Errorf("computeQoSClass() = %v, want %v", got, tt.want)
+			}
+		})
+	}
 }

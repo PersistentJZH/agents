@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
@@ -89,6 +90,23 @@ func handleInPlaceUpdateCommon(
 		if !inplaceupdate.IsInplaceUpdateCompleted(ctx, pod) {
 			return false, nil
 		}
+		return true, nil
+	}
+
+	// Pre-check: reject resize if it would change the pod's QoS class
+	origQoS, newQoS, qosChanged := inplaceupdate.CheckResizeQoSChange(box, pod)
+	if qosChanged {
+		msg := fmt.Sprintf("resource resize would change QoS class from %s to %s, resize rejected", origQoS, newQoS)
+		logger.Info(msg)
+		handler.GetRecorder().Eventf(box, corev1.EventTypeWarning, "InplaceUpdateFailed", msg)
+		cond := metav1.Condition{
+			Type:               string(agentsv1alpha1.SandboxConditionInplaceUpdate),
+			Status:             metav1.ConditionTrue,
+			Reason:             agentsv1alpha1.SandboxInplaceUpdateReasonFailed,
+			Message:            msg,
+			LastTransitionTime: metav1.Now(),
+		}
+		utils.SetSandboxCondition(newStatus, cond)
 		return true, nil
 	}
 

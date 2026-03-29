@@ -6,6 +6,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/utils/ptr"
 
 	"github.com/openkruise/agents/api/v1alpha1"
@@ -88,6 +90,47 @@ func TestParseExtensions(t *testing.T) {
 				CreateOnNoStock:  true,
 				WaitReadySeconds: 1234,
 			},
+		},
+		{
+			name: "valid cpu target",
+			metadata: map[string]string{
+				ExtensionKeyClaimWithCPURequest: "500m",
+				ExtensionKeyClaimWithCPULimit:   "500m",
+			},
+			wantErr: false,
+			expectExtension: NewSandboxRequestExtension{
+				CreateOnNoStock: true,
+				InplaceUpdate: InplaceUpdateExtension{
+					Resources: &InplaceUpdateResourcesExtension{
+						Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m")},
+						Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m")},
+					},
+				},
+			},
+		},
+		{
+			name: "valid cpu target with both request and limit",
+			metadata: map[string]string{
+				ExtensionKeyClaimWithCPURequest: "1500m",
+				ExtensionKeyClaimWithCPULimit:   "1500m",
+			},
+			wantErr: false,
+			expectExtension: NewSandboxRequestExtension{
+				CreateOnNoStock: true,
+				InplaceUpdate: InplaceUpdateExtension{
+					Resources: &InplaceUpdateResourcesExtension{
+						Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1500m")},
+						Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1500m")},
+					},
+				},
+			},
+		},
+		{
+			name: "invalid cpu target - zero",
+			metadata: map[string]string{
+				ExtensionKeyClaimWithCPURequest: "0",
+			},
+			wantErr: true,
 		},
 		{
 			name: "valid csi mount extension",

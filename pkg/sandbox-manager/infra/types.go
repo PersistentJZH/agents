@@ -26,7 +26,7 @@ type ClaimSandboxOptions struct {
 	Modifier func(sandbox Sandbox) `json:"-"`
 	// Set ReserveFailedSandbox to true to reserve failed sandboxes
 	ReserveFailedSandbox bool `json:"reserveFailedSandbox"`
-	// Set InplaceUpdate to non-empty string trigger an inplace-update
+	// Set InplaceUpdate to trigger an inplace-update (image and/or resources)
 	InplaceUpdate *config.InplaceUpdateOptions `json:"inplaceUpdate"`
 	// Set RuntimeConfig to non-nil value to inject runtime configuration
 	RuntimeConfig []v1alpha1.RuntimeConfig `json:"runtimeConfig"`

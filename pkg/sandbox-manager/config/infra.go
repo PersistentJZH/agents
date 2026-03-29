@@ -1,5 +1,7 @@
 package config
 
+import corev1 "k8s.io/api/core/v1"
+
 type InitRuntimeOptions struct {
 	EnvVars     map[string]string `json:"envVars,omitempty"`
 	AccessToken string            `json:"accessToken,omitempty"`
@@ -18,4 +20,14 @@ type MountConfig struct {
 
 type InplaceUpdateOptions struct {
 	Image string
+	// Resources specifies in-place resource update options.
+	// +optional
+	Resources *InplaceUpdateResourcesOptions `json:"resources,omitempty"`
+}
+
+type InplaceUpdateResourcesOptions struct {
+	// Requests specifies the target resource requests.
+	Requests corev1.ResourceList
+	// Limits specifies the target resource limits.
+	Limits corev1.ResourceList
 }

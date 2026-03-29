@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/distribution/reference"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/utils/ptr"
 
@@ -19,6 +21,8 @@ import (
 const (
 	ExtensionKeyClaimTimeout                  = v1alpha1.E2BPrefix + "claim-timeout-seconds"
 	ExtensionKeyWaitReadyTimeout              = v1alpha1.E2BPrefix + "wait-ready-timeout-seconds"
+	ExtensionKeyClaimWithCPURequest           = v1alpha1.E2BPrefix + "claim-with-cpu-request"
+	ExtensionKeyClaimWithCPULimit             = v1alpha1.E2BPrefix + "claim-with-cpu-limit"
 	ExtensionKeyClaimWithImage                = v1alpha1.E2BPrefix + "image"
 	ExtensionKeyClaimWithCSIMount             = v1alpha1.E2BPrefix + "csi"
 	ExtensionKeyClaimWithCSIMount_VolumeName  = ExtensionKeyClaimWithCSIMount + "-volume-name"
@@ -116,6 +120,39 @@ func (r *NewSandboxRequest) parseExtensionImage() error {
 		r.Extensions.InplaceUpdate.Image = image
 		delete(r.Metadata, ExtensionKeyClaimWithImage)
 	}
+	if err := r.parseExtensionResources(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (r *NewSandboxRequest) parseExtensionResources() error {
+	cpuReq, hasCPUReq, err := r.parseAndRemoveQuantity(ExtensionKeyClaimWithCPURequest)
+	if err != nil {
+		return err
+	}
+	cpuLim, hasCPULim, err := r.parseAndRemoveQuantity(ExtensionKeyClaimWithCPULimit)
+	if err != nil {
+		return err
+	}
+	if !hasCPUReq && !hasCPULim {
+		return nil
+	}
+	if r.Extensions.InplaceUpdate.Resources == nil {
+		r.Extensions.InplaceUpdate.Resources = &InplaceUpdateResourcesExtension{}
+	}
+	if hasCPUReq {
+		if r.Extensions.InplaceUpdate.Resources.Requests == nil {
+			r.Extensions.InplaceUpdate.Resources.Requests = corev1.ResourceList{}
+		}
+		r.Extensions.InplaceUpdate.Resources.Requests[corev1.ResourceCPU] = cpuReq
+	}
+	if hasCPULim {
+		if r.Extensions.InplaceUpdate.Resources.Limits == nil {
+			r.Extensions.InplaceUpdate.Resources.Limits = corev1.ResourceList{}
+		}
+		r.Extensions.InplaceUpdate.Resources.Limits[corev1.ResourceCPU] = cpuLim
+	}
 	return nil
 }
 
@@ -207,6 +244,21 @@ func (r *NewSandboxRequest) parseAndRemoveIntExtension(key string) (int, error) 
 	return 0, nil
 }
 
+func (r *NewSandboxRequest) parseAndRemoveQuantity(key string) (resource.Quantity, bool, error) {
+	raw, ok := r.Metadata[key]
+	if !ok {
+		return resource.Quantity{}, false, nil
+	}
+	defer delete(r.Metadata, key)
+	qty, err := resource.ParseQuantity(raw)
+	if err != nil {
+		return resource.Quantity{}, false, fmt.Errorf("invalid quantity for %s [%s]: %v", key, raw, err)
+	}
+	if qty.IsZero() || qty.Cmp(resource.Quantity{}) < 0 {
+		return resource.Quantity{}, false, fmt.Errorf("%s must be a positive value, got [%s]", key, raw)
+	}
+	return qty, true, nil
+}
 func (s *NewSnapshotRequest) ParseExtensions(headers http.Header) error {
 	// KeepRunning
 	switch headers.Get(ExtensionHeaderSnapshotKeepRunning) {

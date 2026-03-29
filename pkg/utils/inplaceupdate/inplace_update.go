@@ -19,8 +19,10 @@ package inplaceupdate
 import (
 	"context"
 	"encoding/json"
+	"reflect"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/klog/v2"
@@ -51,6 +53,9 @@ type InPlaceUpdateState struct {
 
 	// UpdateImages indicates there are images that should be in-place update.
 	UpdateImages bool `json:"updateImages,omitempty"`
+
+	// UpdateResources indicates there are resources that should be in-place update.
+	UpdateResources bool `json:"updateResources,omitempty"`
 }
 
 // InPlaceUpdateContainerStatus records the statuses of the container that are mainly used
@@ -94,6 +99,17 @@ func NewInPlaceUpdateControl(c client.Client, patchFunc GeneratePatchBodyFunc) *
 	return control
 }
 
+func (c *InPlaceUpdateControl) generatePatchBody(opts InPlaceUpdateOptions) string {
+	if c.generatePatchBodyFunc == nil {
+		return DefaultGeneratePatchBodyFunc(opts)
+	}
+	return c.generatePatchBodyFunc(opts)
+}
+
+func (c *InPlaceUpdateControl) generateResizeSubresourceBody(opts InPlaceUpdateOptions) *corev1.Pod {
+	return DefaultGenerateResizeSubresourceBody(opts)
+}
+
 func DefaultGeneratePatchBodyFunc(opts InPlaceUpdateOptions) string {
 	box, pod, revision := opts.Box, opts.Pod, opts.Revision
 	state := &InPlaceUpdateState{
@@ -135,43 +151,254 @@ func DefaultGeneratePatchBodyFunc(opts InPlaceUpdateOptions) string {
 		if !ok {
 			continue
 		}
-		if origin.Image == container.Image {
+		imageChanged := origin.Image != container.Image
+		resourceChanged := !reflect.DeepEqual(origin.Resources, container.Resources)
+		if !imageChanged && !resourceChanged {
 			continue
 		}
 		patchContainer := corev1.Container{
-			Name:  container.Name,
-			Image: origin.Image,
+			Name: container.Name,
 		}
-		patch.Spec.Containers = append(patch.Spec.Containers, patchContainer)
-		state.UpdateImages = true
-		imageId := originStatus[container.Name]
-		state.LastContainerStatuses[container.Name] = InPlaceUpdateContainerStatus{
-			ImageID: imageId,
+		if imageChanged {
+			patchContainer.Image = origin.Image
+			patchSpec.Containers = append(patchSpec.Containers, patchContainer)
+			state.UpdateImages = true
+			imageId := originStatus[container.Name]
+			state.LastContainerStatuses[container.Name] = InPlaceUpdateContainerStatus{
+				ImageID: imageId,
+			}
+		}
+		if resourceChanged {
+			state.UpdateResources = true
 		}
 	}
+	if !state.UpdateImages && !state.UpdateResources {
+		return ""
+	}
+
 	annotations := map[string]string{
 		PodAnnotationInPlaceUpdateStateKey: utils.DumpJson(state),
 	}
-	patch.Labels = labels
-	patch.Annotations = annotations
+	labels := map[string]string{
+		agentsapiv1alpha1.PodLabelTemplateHash: revision,
+	}
+
+	patch := map[string]any{
+		"metadata": map[string]any{
+			"annotations": annotations,
+			"labels":      labels,
+		},
+	}
+	if len(patchSpec.Containers) > 0 {
+		patch["spec"] = map[string]any{
+			"containers": patchSpec.Containers,
+		}
+	}
 	return utils.DumpJson(patch)
+}
+
+// buildContainerResourcesMap builds a map from template containers.
+func buildContainerResourcesMap(containers []corev1.Container) map[string]corev1.Container {
+	result := make(map[string]corev1.Container, len(containers))
+	for _, c := range containers {
+		result[c.Name] = c
+	}
+	return result
+}
+
+// DefaultGenerateResizeSubresourceBody generates the Pod body for resize subResource update.
+// It compares the current pod's container resources with the sandbox's container resources,
+// and returns a minimal Pod object containing only the fields required by the resize API:
+//   - metadata.name, metadata.namespace, metadata.resourceVersion
+//   - spec.containers[].resources
+//
+// Only the main containers are processed; init containers are not resized.
+// Returns nil if no resource changes are detected.
+func DefaultGenerateResizeSubresourceBody(opts InPlaceUpdateOptions) *corev1.Pod {
+	box, pod := opts.Box, opts.Pod
+	if box.Spec.Template == nil {
+		return nil
+	}
+
+	originContainers := buildContainerResourcesMap(box.Spec.Template.Spec.Containers)
+
+	resizeBody := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            pod.Name,
+			Namespace:       pod.Namespace,
+			ResourceVersion: pod.ResourceVersion,
+		},
+		Spec: corev1.PodSpec{
+			Containers: make([]corev1.Container, len(pod.Spec.Containers)),
+		},
+	}
+	for i := range pod.Spec.Containers {
+		resizeBody.Spec.Containers[i] = corev1.Container{
+			Name:      pod.Spec.Containers[i].Name,
+			Resources: pod.Spec.Containers[i].Resources,
+		}
+	}
+
+	changed := false
+	for i := range resizeBody.Spec.Containers {
+		container := &resizeBody.Spec.Containers[i]
+		origin, ok := originContainers[container.Name]
+		if !ok {
+			continue
+		}
+		if reflect.DeepEqual(origin.Resources, container.Resources) {
+			continue
+		}
+		container.Resources = origin.Resources
+		changed = true
+	}
+	if !changed {
+		return nil
+	}
+	return resizeBody
+}
+
+// CheckResizeQoSChange checks if applying the sandbox template resources to the pod
+// would change the pod's QoS class. Returns the original and new QoS classes plus
+// a boolean indicating whether a change would occur.
+func CheckResizeQoSChange(box *agentsapiv1alpha1.Sandbox, pod *corev1.Pod) (orig, updated corev1.PodQOSClass, changed bool) {
+	if box.Spec.Template == nil {
+		return "", "", false
+	}
+	orig = computeQoSClass(pod)
+
+	afterPod := pod.DeepCopy()
+	templateContainers := buildContainerResourcesMap(box.Spec.Template.Spec.Containers)
+	for i := range afterPod.Spec.Containers {
+		if tmpl, ok := templateContainers[afterPod.Spec.Containers[i].Name]; ok {
+			afterPod.Spec.Containers[i].Resources = tmpl.Resources
+		}
+	}
+	updated = computeQoSClass(afterPod)
+	return orig, updated, orig != updated
+}
+
+var zeroQuantity = resource.MustParse("0")
+
+func isSupportedQoSComputeResource(name corev1.ResourceName) bool {
+	return name == corev1.ResourceCPU || name == corev1.ResourceMemory
+}
+
+// processResourceList adds non-zero quantities for supported QoS compute
+// resources from newList into list.
+func processResourceList(list, newList corev1.ResourceList) {
+	for name, quantity := range newList {
+		if !isSupportedQoSComputeResource(name) {
+			continue
+		}
+		if quantity.Cmp(zeroQuantity) == 1 {
+			delta := quantity.DeepCopy()
+			if _, exists := list[name]; !exists {
+				list[name] = delta
+			} else {
+				delta.Add(list[name])
+				list[name] = delta
+			}
+		}
+	}
+}
+
+// getQOSResources returns the set of supported QoS resource names that have
+// a quantity greater than zero.
+func getQOSResources(list corev1.ResourceList) map[corev1.ResourceName]bool {
+	qosResources := make(map[corev1.ResourceName]bool)
+	for name, quantity := range list {
+		if !isSupportedQoSComputeResource(name) {
+			continue
+		}
+		if quantity.Cmp(zeroQuantity) == 1 {
+			qosResources[name] = true
+		}
+	}
+	return qosResources
+}
+
+// computeQoSClass determines the QoS class of a Pod following the same
+// algorithm as upstream Kubernetes (qos.ComputePodQOS).
+func computeQoSClass(pod *corev1.Pod) corev1.PodQOSClass {
+	requests := corev1.ResourceList{}
+	limits := corev1.ResourceList{}
+	isGuaranteed := true
+
+	if pod.Spec.Resources != nil {
+		processResourceList(requests, pod.Spec.Resources.Requests)
+		processResourceList(limits, pod.Spec.Resources.Limits)
+		qosLimitResources := getQOSResources(pod.Spec.Resources.Limits)
+		if !qosLimitResources[corev1.ResourceCPU] || !qosLimitResources[corev1.ResourceMemory] {
+			isGuaranteed = false
+		}
+	} else {
+		allContainers := make([]corev1.Container, 0, len(pod.Spec.Containers)+len(pod.Spec.InitContainers))
+		allContainers = append(allContainers, pod.Spec.Containers...)
+		allContainers = append(allContainers, pod.Spec.InitContainers...)
+
+		for _, container := range allContainers {
+			processResourceList(requests, container.Resources.Requests)
+			qosLimitsFound := getQOSResources(container.Resources.Limits)
+			processResourceList(limits, container.Resources.Limits)
+			if !qosLimitsFound[corev1.ResourceCPU] || !qosLimitsFound[corev1.ResourceMemory] {
+				isGuaranteed = false
+			}
+		}
+	}
+
+	if len(requests) == 0 && len(limits) == 0 {
+		return corev1.PodQOSBestEffort
+	}
+	if isGuaranteed {
+		for name, req := range requests {
+			if lim, exists := limits[name]; !exists || lim.Cmp(req) != 0 {
+				isGuaranteed = false
+				break
+			}
+		}
+	}
+	if isGuaranteed && len(requests) == len(limits) {
+		return corev1.PodQOSGuaranteed
+	}
+	return corev1.PodQOSBurstable
 }
 
 func (c *InPlaceUpdateControl) Update(ctx context.Context, opts InPlaceUpdateOptions) (bool, error) {
 	box, pod, revision := opts.Box, opts.Pod, opts.Revision
 	logger := logf.FromContext(ctx).WithValues("sandbox", klog.KObj(box))
 
-	patchBody := c.generatePatchBodyFunc(opts)
-	if patchBody == "" {
-		return false, nil
+	// perform patch
+	patchBody := c.generatePatchBody(opts)
+	current := pod.DeepCopy()
+	if patchBody != "" {
+		if err := c.Patch(ctx, current, client.RawPatch(types.StrategicMergePatchType, []byte(patchBody))); err != nil {
+			logger.Error(err, "inplace update pod patch failed")
+			return false, err
+		}
 	}
 
-	clone := pod.DeepCopy()
-	if err := c.Patch(ctx, clone, client.RawPatch(types.StrategicMergePatchType, []byte(patchBody))); err != nil {
-		logger.Error(err, "inplace update pod failed", "body", patchBody)
-		return false, err
+	// perform resize
+	resizeBody := c.generateResizeSubresourceBody(InPlaceUpdateOptions{
+		Box:      box,
+		Revision: revision,
+		// Use `current` (the post-patch pod) instead of the original `pod` so that
+		// generateResizeSubresourceBody picks up the latest ResourceVersion set by
+		// the patch response, avoiding "the object has been modified" conflicts on
+		// the subsequent resize sub-resource call.
+		Pod: current,
+	})
+	if resizeBody != nil {
+		if err := c.SubResource("resize").Update(ctx, current, client.WithSubResourceBody(resizeBody)); err != nil {
+			logger.Error(err, "inplace update pod resize failed")
+			return false, err
+		}
 	}
-	logger.Info("inplace update pod success", "revision", revision, "patchBody", patchBody)
+
+	if patchBody == "" && resizeBody == nil {
+		return false, nil
+	}
+	logger.Info("inplace update pod success", "revision", revision, "patchBody", patchBody, "hasResizeBody", resizeBody != nil)
 	return true, nil
 }
 
@@ -182,14 +409,69 @@ func IsInplaceUpdateCompleted(ctx context.Context, pod *corev1.Pod) bool {
 	if state == nil || err != nil {
 		return true
 	}
-	// container.Name -> imageId
-	cStatus := map[string]string{}
-	for _, status := range pod.Status.ContainerStatuses {
-		cStatus[status.Name] = status.ImageID
+	if state.UpdateImages {
+		if !isPodImageUpdateCompleted(pod, state) {
+			logger.Info("pod container image inplace update is not completed yet")
+			return false
+		}
 	}
-	for name, status := range state.LastContainerStatuses {
-		if old, ok := cStatus[name]; !ok || old == status.ImageID {
-			logger.Info("pod container inplace update is incompleted", "container", name, "old imageId", old, "cur imageId", status.ImageID)
+	if state.UpdateResources {
+		if !isPodResourceResizeCompleted(pod) {
+			logger.Info("pod resize resources are not applied yet")
+			return false
+		}
+	}
+	return true
+}
+
+// isPodImageUpdateCompleted checks whether image updates have been applied by comparing
+// each container's current ImageID against the ImageID recorded before the update.
+// Returns true if all containers have a new (different) ImageID.
+func isPodImageUpdateCompleted(pod *corev1.Pod, state *InPlaceUpdateState) bool {
+	currentImageIDs := make(map[string]string, len(pod.Status.ContainerStatuses))
+	for _, status := range pod.Status.ContainerStatuses {
+		currentImageIDs[status.Name] = status.ImageID
+	}
+	for name, lastStatus := range state.LastContainerStatuses {
+		if curID, ok := currentImageIDs[name]; !ok || curID == lastStatus.ImageID {
+			return false
+		}
+	}
+	return true
+}
+
+// isPodResourceResizeCompleted checks whether the in-place resource resize has been
+// fully applied by the kubelet. It compares each container's spec resources against
+// the actual resources reported in status.containerStatuses[].resources, returning
+// true only when all containers' status resources match their spec.
+func isPodResourceResizeCompleted(pod *corev1.Pod) bool {
+	if len(pod.Spec.Containers) == 0 {
+		return false
+	}
+	statusMap := make(map[string]*corev1.ContainerStatus, len(pod.Status.ContainerStatuses))
+	for i := range pod.Status.ContainerStatuses {
+		statusMap[pod.Status.ContainerStatuses[i].Name] = &pod.Status.ContainerStatuses[i]
+	}
+	for i := range pod.Spec.Containers {
+		c := &pod.Spec.Containers[i]
+		status, ok := statusMap[c.Name]
+		if !ok || status.Resources == nil {
+			return false
+		}
+		if !isResourceListCovered(status.Resources.Requests, c.Resources.Requests) {
+			return false
+		}
+		if !isResourceListCovered(status.Resources.Limits, c.Resources.Limits) {
+			return false
+		}
+	}
+	return true
+}
+
+func isResourceListCovered(actual, expected corev1.ResourceList) bool {
+	for name, expectedQ := range expected {
+		actualQ, ok := actual[name]
+		if !ok || actualQ.Cmp(expectedQ) != 0 {
 			return false
 		}
 	}
