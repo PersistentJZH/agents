@@ -409,7 +409,7 @@ func (c *InPlaceUpdateControl) Update(ctx context.Context, opts InPlaceUpdateOpt
 
 	current := pod.DeepCopy()
 	// In-place update involves two sub-operations:
-	//   1. Resource resize  — adjust CPU via the pods/resize subresource.
+	//   1. Resource resize  — adjust compute resources via the pods/resize subresource.
 	//   2. Metadata/image patch — update container images and the pod-template-hash annotation.
 	//
 	// The pod-template-hash annotation is the authoritative signal that the upgrade has completed.
@@ -479,11 +479,11 @@ func (c *InPlaceUpdateControl) resizeContainers(ctx context.Context, logger klog
 	if !c.useDirectResourcePatch.Load() {
 		err := c.SubResource("resize").Patch(ctx, pod, client.RawPatch(types.StrategicMergePatchType, []byte(resourcePatch)))
 		if err == nil {
-			logger.Info("inplace update pod resize succeeded via resize subresource (K8s >= 1.33)")
+			logger.Info("inplace update pod resize succeeded via resize subresource patch (K8s >= 1.33)")
 			return nil
 		}
 		if !apierrors.IsNotFound(err) {
-			logger.Error(err, "inplace update pod resize failed via resize subresource")
+			logger.Error(err, "inplace update pod resize failed via resize subresource patch")
 			return err
 		}
 		// The pods/resize subresource was introduced in K8s 1.33. On K8s 1.27-1.32,

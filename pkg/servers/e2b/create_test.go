@@ -573,21 +573,48 @@ func TestCreateSandboxWithClaim_NamingExtensionRejected(t *testing.T) {
 }
 
 func TestCreateSandboxWithClone_InplaceUpdateRejected(t *testing.T) {
-	ctrl := &Controller{}
-	request := models.NewSandboxRequest{
-		TemplateID: "test-checkpoint",
-		Extensions: models.NewSandboxRequestExtension{
-			InplaceUpdate: models.InplaceUpdateExtension{
+	tests := []struct {
+		name        string
+		inplace     models.InplaceUpdateExtension
+		expectError string
+	}{
+		{
+			name: "image update rejected",
+			inplace: models.InplaceUpdateExtension{
 				Image: "nginx:latest",
 			},
+			expectError: "InplaceUpdate is not supported for clone",
+		},
+		{
+			name: "memory resize rejected",
+			inplace: models.InplaceUpdateExtension{
+				Resources: &models.InplaceUpdateResourcesExtension{
+					Requests: corev1.ResourceList{
+						corev1.ResourceMemory: resource.MustParse("512Mi"),
+					},
+				},
+			},
+			expectError: "InplaceUpdate is not supported for clone",
 		},
 	}
-	user := &models.CreatedTeamAPIKey{ID: uuid.New(), Name: "test-user"}
 
-	_, apiErr := ctrl.createSandboxWithClone(context.Background(), request, user, "")
-	require.NotNil(t, apiErr)
-	assert.Equal(t, http.StatusBadRequest, apiErr.Code)
-	assert.Contains(t, apiErr.Message, "InplaceUpdate is not supported for clone")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctrl := &Controller{}
+			request := models.NewSandboxRequest{
+				TemplateID: "test-checkpoint",
+				Extensions: models.NewSandboxRequestExtension{
+					InplaceUpdate: tt.inplace,
+				},
+			}
+			user := &models.CreatedTeamAPIKey{ID: uuid.New(), Name: "test-user"}
+
+			_, apiErr := ctrl.createSandboxWithClone(context.Background(), request, user, "")
+			require.NotNil(t, apiErr)
+			assert.Equal(t, http.StatusBadRequest, apiErr.Code)
+			assert.Contains(t, apiErr.Message, tt.expectError)
+		})
+	}
 }
 
 // TestCreateSandboxWithClone_Naming asserts that Extensions.Name and
