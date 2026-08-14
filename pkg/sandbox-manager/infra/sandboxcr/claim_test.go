@@ -1922,12 +1922,78 @@ func TestBuildResourceResizedPod(t *testing.T) {
 		corev1.ResourceCPU:    targetCPU,
 		corev1.ResourceMemory: targetMemory,
 	}
-	got, changed := buildResourceResizedPod(pod, requests, limits)
+	got, changed, err := buildResourceResizedPod(pod, requests, limits)
+	require.NoError(t, err)
 	require.True(t, changed)
 	assert.Equal(t, int64(500), got.Spec.Containers[0].Resources.Requests.Cpu().MilliValue())
 	assert.Equal(t, int64(500), got.Spec.Containers[0].Resources.Limits.Cpu().MilliValue())
 	assert.Equal(t, targetMemory, got.Spec.Containers[0].Resources.Requests[corev1.ResourceMemory])
 	assert.Equal(t, targetMemory, got.Spec.Containers[0].Resources.Limits[corev1.ResourceMemory])
+}
+
+func TestBuildResourceResizedPod_MemoryDownscaleRejected(t *testing.T) {
+	pod := &corev1.Pod{
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{
+				Name: "main",
+				Resources: corev1.ResourceRequirements{
+					Requests: corev1.ResourceList{
+						corev1.ResourceCPU:    resource.MustParse("500m"),
+						corev1.ResourceMemory: resource.MustParse("256Mi"),
+					},
+					Limits: corev1.ResourceList{
+						corev1.ResourceCPU:    resource.MustParse("500m"),
+						corev1.ResourceMemory: resource.MustParse("512Mi"),
+					},
+				},
+			}},
+		},
+	}
+
+	tests := []struct {
+		name        string
+		requests    corev1.ResourceList
+		limits      corev1.ResourceList
+		expectError string
+	}{
+		{
+			name:        "lower memory request rejected",
+			requests:    corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("128Mi")},
+			expectError: "in-place memory downscale is not supported",
+		},
+		{
+			name:        "lower memory limit rejected",
+			limits:      corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("256Mi")},
+			expectError: "in-place memory downscale is not supported",
+		},
+		{
+			name:     "equal memory accepted",
+			requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("256Mi")},
+			limits:   corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("512Mi")},
+		},
+		{
+			name:     "memory upscale accepted",
+			requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("512Mi")},
+			limits:   corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("1Gi")},
+		},
+		{
+			name:     "cpu downscale still allowed",
+			requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("250m")},
+			limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("250m")},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, _, err := buildResourceResizedPod(pod, tt.requests, tt.limits)
+			if tt.expectError != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.expectError)
+				return
+			}
+			require.NoError(t, err)
+		})
+	}
 }
 
 func TestValidateAndInitClaimOptions_ResourceResize(t *testing.T) {
@@ -1958,6 +2024,36 @@ func TestValidateAndInitClaimOptions_ResourceResize(t *testing.T) {
 					corev1.ResourceMemory: resource.MustParse("512Mi"),
 				},
 			},
+		},
+		{
+			name: "cpu request exceeding limit rejected",
+			resources: &config.InplaceUpdateResourcesOptions{
+				Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2")},
+				Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1")},
+			},
+			expectError: "target cpu request 2 must not exceed limit 1",
+		},
+		{
+			name: "memory request exceeding limit rejected",
+			resources: &config.InplaceUpdateResourcesOptions{
+				Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("1Gi")},
+				Limits:   corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("512Mi")},
+			},
+			expectError: "target memory request 1Gi must not exceed limit 512Mi",
+		},
+		{
+			name: "unknown request resource rejected",
+			resources: &config.InplaceUpdateResourcesOptions{
+				Requests: corev1.ResourceList{"nvidia.com/gpu": resource.MustParse("1")},
+			},
+			expectError: "resource nvidia.com/gpu is not supported for in-place resize",
+		},
+		{
+			name: "unknown limit resource rejected",
+			resources: &config.InplaceUpdateResourcesOptions{
+				Limits: corev1.ResourceList{corev1.ResourceEphemeralStorage: resource.MustParse("1Gi")},
+			},
+			expectError: "resource ephemeral-storage is not supported for in-place resize",
 		},
 	}
 

@@ -2689,6 +2689,106 @@ func TestCheckResizeQoSChange(t *testing.T) {
 	}
 }
 
+func TestCheckMemoryDownscale(t *testing.T) {
+	boxWithMemory := func(req, lim string) *agentsv1alpha1.Sandbox {
+		return &agentsv1alpha1.Sandbox{
+			Spec: agentsv1alpha1.SandboxSpec{
+				EmbeddedSandboxTemplate: agentsv1alpha1.EmbeddedSandboxTemplate{
+					Template: &corev1.PodTemplateSpec{
+						Spec: corev1.PodSpec{
+							Containers: []corev1.Container{{
+								Name: "main",
+								Resources: corev1.ResourceRequirements{
+									Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse(req)},
+									Limits:   corev1.ResourceList{corev1.ResourceMemory: resource.MustParse(lim)},
+								},
+							}},
+						},
+					},
+				},
+			},
+		}
+	}
+	podWithMemory := func(req, lim string) *corev1.Pod {
+		return &corev1.Pod{
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{
+					Name: "main",
+					Resources: corev1.ResourceRequirements{
+						Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse(req)},
+						Limits:   corev1.ResourceList{corev1.ResourceMemory: resource.MustParse(lim)},
+					},
+				}},
+			},
+		}
+	}
+
+	tests := []struct {
+		name        string
+		box         *agentsv1alpha1.Sandbox
+		pod         *corev1.Pod
+		expectError string
+	}{
+		{
+			name:        "lower memory request rejected",
+			box:         boxWithMemory("128Mi", "512Mi"),
+			pod:         podWithMemory("256Mi", "512Mi"),
+			expectError: "memory request 128Mi is lower than the current value 256Mi",
+		},
+		{
+			name:        "lower memory limit rejected",
+			box:         boxWithMemory("256Mi", "256Mi"),
+			pod:         podWithMemory("256Mi", "512Mi"),
+			expectError: "memory limit 256Mi is lower than the current value 512Mi",
+		},
+		{
+			name: "upscale accepted",
+			box:  boxWithMemory("512Mi", "1Gi"),
+			pod:  podWithMemory("256Mi", "512Mi"),
+		},
+		{
+			name: "equal accepted",
+			box:  boxWithMemory("256Mi", "512Mi"),
+			pod:  podWithMemory("256Mi", "512Mi"),
+		},
+		{
+			name: "container not in template ignored",
+			box:  boxWithMemory("128Mi", "512Mi"),
+			pod: &corev1.Pod{Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{
+					Name: "other",
+					Resources: corev1.ResourceRequirements{
+						Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("256Mi")},
+					},
+				}},
+			}},
+		},
+		{
+			name: "nil template accepted",
+			box:  &agentsv1alpha1.Sandbox{},
+			pod:  podWithMemory("256Mi", "512Mi"),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := CheckMemoryDownscale(tt.box, tt.pod)
+			if tt.expectError != "" {
+				if err == nil {
+					t.Fatalf("expected error containing %q, got nil", tt.expectError)
+				}
+				if !strings.Contains(err.Error(), tt.expectError) {
+					t.Fatalf("expected error containing %q, got %v", tt.expectError, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
 func TestComputeQoSClass(t *testing.T) {
 	tests := []struct {
 		name string

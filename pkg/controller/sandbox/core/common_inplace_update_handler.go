@@ -142,6 +142,23 @@ func handleInPlaceUpdateCommon(
 		return true, nil
 	}
 
+	// Reject memory downscale up front. The resize path treats "actual >= desired"
+	// as satisfied, so a lower memory target would otherwise be silently ignored
+	// and leave the sandbox template permanently diverged from the live pod.
+	if downscaleErr := inplaceupdate.CheckMemoryDownscale(box, pod); downscaleErr != nil {
+		msg := downscaleErr.Error()
+		klog.FromContext(ctx).Info(msg, "sandbox", klog.KObj(box))
+		handler.GetRecorder().Eventf(box, corev1.EventTypeWarning, "InplaceUpdateFailed", msg)
+		utils.SetSandboxCondition(newStatus, metav1.Condition{
+			Type:               string(agentsv1alpha1.SandboxConditionInplaceUpdate),
+			Status:             metav1.ConditionFalse,
+			Reason:             agentsv1alpha1.SandboxInplaceUpdateReasonFailed,
+			Message:            msg,
+			LastTransitionTime: metav1.Now(),
+		})
+		return true, nil
+	}
+
 	// If only metadata (labels/annotations) changed, directly patch the pod metadata
 	// without going through the in-place update flow. This avoids unnecessarily
 	// setting the InplaceUpdate condition and Ready=False, which would block

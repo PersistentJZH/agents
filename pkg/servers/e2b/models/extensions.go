@@ -245,15 +245,20 @@ func (r *NewSandboxRequest) parseExtensionImage() error {
 }
 
 func (r *NewSandboxRequest) parseExtensionResources() error {
+	type resourceTarget int
+	const (
+		targetRequests resourceTarget = iota
+		targetLimits
+	)
 	resourceExtensions := []struct {
 		key          string
 		resourceName corev1.ResourceName
-		isRequest    bool
+		target       resourceTarget
 	}{
-		{key: ExtensionKeyClaimWithCPURequest, resourceName: corev1.ResourceCPU, isRequest: true},
-		{key: ExtensionKeyClaimWithCPULimit, resourceName: corev1.ResourceCPU},
-		{key: ExtensionKeyClaimWithMemoryRequest, resourceName: corev1.ResourceMemory, isRequest: true},
-		{key: ExtensionKeyClaimWithMemoryLimit, resourceName: corev1.ResourceMemory},
+		{key: ExtensionKeyClaimWithCPURequest, resourceName: corev1.ResourceCPU, target: targetRequests},
+		{key: ExtensionKeyClaimWithCPULimit, resourceName: corev1.ResourceCPU, target: targetLimits},
+		{key: ExtensionKeyClaimWithMemoryRequest, resourceName: corev1.ResourceMemory, target: targetRequests},
+		{key: ExtensionKeyClaimWithMemoryLimit, resourceName: corev1.ResourceMemory, target: targetLimits},
 	}
 	for _, extension := range resourceExtensions {
 		quantity, ok, err := r.parseAndRemoveQuantity(extension.key)
@@ -266,7 +271,7 @@ func (r *NewSandboxRequest) parseExtensionResources() error {
 		if r.Extensions.InplaceUpdate.Resources == nil {
 			r.Extensions.InplaceUpdate.Resources = &InplaceUpdateResourcesExtension{}
 		}
-		if extension.isRequest {
+		if extension.target == targetRequests {
 			if r.Extensions.InplaceUpdate.Resources.Requests == nil {
 				r.Extensions.InplaceUpdate.Resources.Requests = corev1.ResourceList{}
 			}

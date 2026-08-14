@@ -42,6 +42,7 @@ import (
 	cacheutils "github.com/openkruise/agents/pkg/cache/utils"
 	"github.com/openkruise/agents/pkg/controller/sandboxset"
 	"github.com/openkruise/agents/pkg/identity"
+	"github.com/openkruise/agents/pkg/sandbox-manager/config"
 	"github.com/openkruise/agents/pkg/sandbox-manager/consts"
 	"github.com/openkruise/agents/pkg/sandbox-manager/infra"
 	"github.com/openkruise/agents/pkg/sandbox-manager/logs"
@@ -82,21 +83,8 @@ func ValidateAndInitClaimOptions(opts infra.ClaimSandboxOptions) (infra.ClaimSan
 	if opts.InplaceUpdate != nil && opts.InplaceUpdate.Image == "" && opts.InplaceUpdate.Resources == nil {
 		return infra.ClaimSandboxOptions{}, fmt.Errorf("inplace update requires at least one of image or resources to be set")
 	}
-	if opts.InplaceUpdate != nil && opts.InplaceUpdate.Resources != nil {
-		res := opts.InplaceUpdate.Resources
-		if len(res.Requests) == 0 && len(res.Limits) == 0 {
-			return infra.ClaimSandboxOptions{}, fmt.Errorf("resources must specify at least one of requests or limits")
-		}
-		for _, rl := range []corev1.ResourceList{res.Requests, res.Limits} {
-			for resourceName, quantity := range rl {
-				if !supportedResizeResources[resourceName] {
-					continue
-				}
-				if quantity.IsZero() || quantity.Cmp(resource.Quantity{}) < 0 {
-					return infra.ClaimSandboxOptions{}, fmt.Errorf("target %s must be a positive value", resourceName)
-				}
-			}
-		}
+	if err := validateInplaceUpdateResources(opts.InplaceUpdate); err != nil {
+		return infra.ClaimSandboxOptions{}, err
 	}
 	if opts.CandidateCounts <= 0 {
 		opts.CandidateCounts = consts.DefaultPoolingCandidateCounts
@@ -114,6 +102,48 @@ func ValidateAndInitClaimOptions(opts infra.ClaimSandboxOptions) (infra.ClaimSan
 		opts.ReserveFailedSandboxFor = ptr.To(DefaultReserveFailedSandboxFor)
 	}
 	return opts, nil
+}
+
+// validateInplaceUpdateResources validates in-place update resource targets.
+// Unsupported resource names are rejected, values must be positive, and
+// requests must not exceed limits. Validation runs in a fixed order so error
+// messages are deterministic regardless of map iteration order.
+func validateInplaceUpdateResources(inplace *config.InplaceUpdateOptions) error {
+	if inplace == nil || inplace.Resources == nil {
+		return nil
+	}
+	res := inplace.Resources
+	if len(res.Requests) == 0 && len(res.Limits) == 0 {
+		return fmt.Errorf("resources must specify at least one of requests or limits")
+	}
+	for name := range res.Requests {
+		if !supportedResizeResources[name] {
+			return fmt.Errorf("resource %s is not supported for in-place resize", name)
+		}
+	}
+	for name := range res.Limits {
+		if !supportedResizeResources[name] {
+			return fmt.Errorf("resource %s is not supported for in-place resize", name)
+		}
+	}
+	for _, name := range []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory} {
+		if quantity, ok := res.Requests[name]; ok {
+			if quantity.IsZero() || quantity.Cmp(resource.Quantity{}) < 0 {
+				return fmt.Errorf("target %s must be a positive value", name)
+			}
+		}
+		if quantity, ok := res.Limits[name]; ok {
+			if quantity.IsZero() || quantity.Cmp(resource.Quantity{}) < 0 {
+				return fmt.Errorf("target %s must be a positive value", name)
+			}
+		}
+		req, hasReq := res.Requests[name]
+		lim, hasLim := res.Limits[name]
+		if hasReq && hasLim && req.Cmp(lim) > 0 {
+			return fmt.Errorf("target %s request %s must not exceed limit %s", name, req.String(), lim.String())
+		}
+	}
+	return nil
 }
 
 // chooseLockString returns the lock string to use for the current attempt.
@@ -714,7 +744,9 @@ func modifyPickedSandbox(sbx *Sandbox, lockType infra.LockType, opts infra.Claim
 			sbx.SetImage(opts.InplaceUpdate.Image)
 		}
 		if opts.InplaceUpdate.Resources != nil {
-			sbx.SetResources(opts.InplaceUpdate.Resources.Requests, opts.InplaceUpdate.Resources.Limits)
+			if err := sbx.SetResources(opts.InplaceUpdate.Resources.Requests, opts.InplaceUpdate.Resources.Limits); err != nil {
+				return terminalMutationError{stage: "inplace update", err: err}
+			}
 		}
 	}
 	// claim sandbox
@@ -762,15 +794,21 @@ func modifyPickedSandbox(sbx *Sandbox, lockType infra.LockType, opts infra.Claim
 }
 
 // SetResources applies in-place resource resize to the first container.
-func (s *Sandbox) SetResources(requests, limits corev1.ResourceList) {
+// It returns an error when the requested memory would lower the container's
+// current memory, since in-place memory downscale is not supported.
+func (s *Sandbox) SetResources(requests, limits corev1.ResourceList) error {
 	if s.Spec.Template == nil {
-		return
+		return nil
 	}
 	pod := &corev1.Pod{
 		Spec: s.Spec.Template.Spec,
 	}
-	resizedPod, _ := buildResourceResizedPod(pod, requests, limits)
+	resizedPod, _, err := buildResourceResizedPod(pod, requests, limits)
+	if err != nil {
+		return err
+	}
 	s.Spec.Template.Spec = resizedPod.Spec
+	return nil
 }
 
 var DefaultCreateSandbox = createSandbox
@@ -825,13 +863,16 @@ func performLockSandbox(ctx context.Context, sbx *Sandbox, lockType infra.LockTy
 	return err
 }
 
-func buildResourceResizedPod(pod *corev1.Pod, requests, limits corev1.ResourceList) (*corev1.Pod, bool) {
+func buildResourceResizedPod(pod *corev1.Pod, requests, limits corev1.ResourceList) (*corev1.Pod, bool, error) {
 	if len(pod.Spec.Containers) == 0 {
-		return pod.DeepCopy(), false
+		return pod.DeepCopy(), false, nil
 	}
 	clone := pod.DeepCopy()
-	changed := setContainerResources(&clone.Spec.Containers[0], requests, limits)
-	return clone, changed
+	changed, err := setContainerResources(&clone.Spec.Containers[0], requests, limits)
+	if err != nil {
+		return nil, false, err
+	}
+	return clone, changed, nil
 }
 
 // supportedResizeResources defines which resources are allowed for in-place resize.
@@ -843,14 +884,21 @@ var supportedResizeResources = map[corev1.ResourceName]bool{
 // setContainerResources updates the container's requests and limits for resources
 // listed in supportedResizeResources. Unsupported resource types are silently ignored.
 // A resource is also skipped if it was not originally set on the container.
-func setContainerResources(container *corev1.Container, requests, limits corev1.ResourceList) bool {
+// Memory may only be increased: a target memory request or limit lower than the
+// container's current value returns an error because in-place memory downscale
+// is not supported.
+func setContainerResources(container *corev1.Container, requests, limits corev1.ResourceList) (bool, error) {
 	changed := false
 	for resName, target := range requests {
 		if !supportedResizeResources[resName] {
 			continue
 		}
-		if cur, ok := container.Resources.Requests[resName]; !ok || cur.IsZero() {
+		cur, ok := container.Resources.Requests[resName]
+		if !ok || cur.IsZero() {
 			continue
+		}
+		if resName == corev1.ResourceMemory && target.Cmp(cur) < 0 {
+			return false, fmt.Errorf("target memory request %s must not be lower than the current value %s: in-place memory downscale is not supported", target.String(), cur.String())
 		}
 		if container.Resources.Requests == nil {
 			container.Resources.Requests = corev1.ResourceList{}
@@ -862,8 +910,12 @@ func setContainerResources(container *corev1.Container, requests, limits corev1.
 		if !supportedResizeResources[resName] {
 			continue
 		}
-		if cur, ok := container.Resources.Limits[resName]; !ok || cur.IsZero() {
+		cur, ok := container.Resources.Limits[resName]
+		if !ok || cur.IsZero() {
 			continue
+		}
+		if resName == corev1.ResourceMemory && target.Cmp(cur) < 0 {
+			return false, fmt.Errorf("target memory limit %s must not be lower than the current value %s: in-place memory downscale is not supported", target.String(), cur.String())
 		}
 		if container.Resources.Limits == nil {
 			container.Resources.Limits = corev1.ResourceList{}
@@ -871,7 +923,7 @@ func setContainerResources(container *corev1.Container, requests, limits corev1.
 		container.Resources.Limits[resName] = target.DeepCopy()
 		changed = true
 	}
-	return changed
+	return changed, nil
 }
 
 func waitForSandboxReady(ctx context.Context, sbx *Sandbox, opts infra.ClaimSandboxOptions, cache infracache.Provider) (cost time.Duration, err error) {

@@ -992,29 +992,45 @@ func TestCreateSandbox_TopLevelMissingTemplateOrCheckpointReturns400(t *testing.
 	assert.Equal(t, int64(0), fakeQuota.acquireCalls.Load())
 }
 
-func TestCreateSandbox_MemoryOverrideRejectedBeforeQuotaAcquire(t *testing.T) {
+func TestCreateSandbox_MemoryOverridePropagatedToClaimedSandbox(t *testing.T) {
 	fakeQuota := &fakeQuotaManager{}
+	controller, client, teardown := SetupWithQuota(t, fakeQuota)
+	defer teardown()
 
-	apiErr := validateCreateResourceOverride(models.NewSandboxRequest{
-		TemplateID: "claim-template",
-		Extensions: models.NewSandboxRequestExtension{
-			InplaceUpdate: models.InplaceUpdateExtension{
-				Resources: &models.InplaceUpdateResourcesExtension{
-					Limits: corev1.ResourceList{
-						corev1.ResourceMemory: resource.MustParse("1024Mi"),
-					},
-				},
-			},
-		},
-		Metadata: map[string]string{
-			models.ExtensionKeySkipInitRuntime: v1alpha1.True,
-		},
+	cleanup := CreateSandboxPool(t, controller, "memory-override-tmpl", 1, CreateSandboxPoolOptions{
+		CPURequest: "100m",
+		Memory:     "128Mi",
 	})
+	defer cleanup()
 
-	require.NotNil(t, apiErr)
-	assert.Equal(t, http.StatusBadRequest, apiErr.Code)
-	assert.Contains(t, apiErr.Message, "memory")
-	assert.Equal(t, int64(0), fakeQuota.acquireCalls.Load())
+	user := quotaLimitedUser([]quotaspec.QuotaLimit{{
+		Dimension: quotaspec.DimSandboxCount,
+		Scope:     quotaspec.ScopeRunning,
+		Limit:     10,
+	}})
+	resp, apiErr := controller.CreateSandbox(NewRequest(t, nil, models.NewSandboxRequest{
+		TemplateID: "memory-override-tmpl",
+		Metadata: map[string]string{
+			models.ExtensionKeySkipInitRuntime:        v1alpha1.True,
+			models.ExtensionKeyClaimWithMemoryRequest: "512Mi",
+			models.ExtensionKeyClaimWithMemoryLimit:   "1Gi",
+		},
+	}, nil, user))
+
+	require.Nil(t, apiErr)
+	require.Equal(t, http.StatusCreated, resp.Code)
+	require.NotNil(t, resp.Body)
+	// The request must proceed past request parsing into the claim flow, so
+	// quota acquisition happens exactly once (the old behavior rejected
+	// memory overrides before quota was ever acquired).
+	assert.Equal(t, int64(1), fakeQuota.acquireCalls.Load())
+
+	claimed := GetSandbox(t, resp.Body.SandboxID, client)
+	resources := claimed.Spec.Template.Spec.Containers[0].Resources
+	assert.Equal(t, resource.MustParse("512Mi"), resources.Requests[corev1.ResourceMemory])
+	assert.Equal(t, resource.MustParse("1Gi"), resources.Limits[corev1.ResourceMemory])
+	// Unrelated resources must be preserved by the memory override.
+	assert.Equal(t, resource.MustParse("100m"), resources.Requests[corev1.ResourceCPU])
 }
 
 func quotaLimitedUser(limits []quotaspec.QuotaLimit) *models.CreatedTeamAPIKey {

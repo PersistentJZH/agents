@@ -1869,6 +1869,242 @@ var _ = Describe("SandboxClaim", func() {
 			}, 15*time.Second, time.Second).Should(BeTrue())
 		})
 
+		It("should reject memory resize that would change QoS class via sandbox condition", func() {
+			// Pool: CPU req=500m/lim=500m, Memory req=128Mi/lim=256Mi → Burstable
+			// (memory req != lim). Resizing memory to req=256Mi/lim=256Mi makes
+			// every request equal its limit → Guaranteed, so the resize is rejected.
+			qosBreakSet := &agentsv1alpha1.SandboxSet{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      fmt.Sprintf("test-pool-memory-qos-break-%d", time.Now().UnixNano()),
+					Namespace: namespace,
+				},
+				Spec: agentsv1alpha1.SandboxSetSpec{
+					Replicas: 1,
+					EmbeddedSandboxTemplate: agentsv1alpha1.EmbeddedSandboxTemplate{
+						Template: &corev1.PodTemplateSpec{
+							Spec: corev1.PodSpec{
+								Containers: []corev1.Container{{
+									Name:  "main",
+									Image: "nginx:stable-alpine3.23",
+									Resources: corev1.ResourceRequirements{
+										Requests: corev1.ResourceList{
+											corev1.ResourceCPU:    resource.MustParse("500m"),
+											corev1.ResourceMemory: resource.MustParse("128Mi"),
+										},
+										Limits: corev1.ResourceList{
+											corev1.ResourceCPU:    resource.MustParse("500m"),
+											corev1.ResourceMemory: resource.MustParse("256Mi"),
+										},
+									},
+								}},
+							},
+						},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, qosBreakSet)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, qosBreakSet) }()
+
+			By("Waiting for pool to be ready")
+			Eventually(func() int32 {
+				_ = k8sClient.Get(ctx, types.NamespacedName{
+					Name:      qosBreakSet.Name,
+					Namespace: qosBreakSet.Namespace,
+				}, qosBreakSet)
+				return qosBreakSet.Status.AvailableReplicas
+			}, time.Minute*2, time.Second).Should(Equal(int32(1)))
+
+			By("Verifying warm sandbox is Burstable")
+			var warmName string
+			Eventually(func() corev1.PodQOSClass {
+				sandboxList := &agentsv1alpha1.SandboxList{}
+				if err := k8sClient.List(ctx, sandboxList, client.InNamespace(namespace), client.MatchingLabels{
+					agentsv1alpha1.LabelSandboxPool: qosBreakSet.Name,
+				}); err != nil || len(sandboxList.Items) == 0 {
+					return ""
+				}
+				warmName = sandboxList.Items[0].Name
+				pod := &corev1.Pod{}
+				if err := k8sClient.Get(ctx, types.NamespacedName{
+					Name:      warmName,
+					Namespace: namespace,
+				}, pod); err != nil {
+					return ""
+				}
+				return pod.Status.QOSClass
+			}, time.Minute, time.Second).Should(Equal(corev1.PodQOSBurstable))
+
+			By("Creating a claim with memory requests/limits=256Mi that would change QoS from Burstable to Guaranteed")
+			qosBreakClaim := &agentsv1alpha1.SandboxClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      fmt.Sprintf("test-claim-memory-qos-break-%d", time.Now().UnixNano()),
+					Namespace: namespace,
+				},
+				Spec: agentsv1alpha1.SandboxClaimSpec{
+					TemplateName:    qosBreakSet.Name,
+					Replicas:        ptr.To(int32(1)),
+					SkipInitRuntime: true,
+					ClaimTimeout:    &metav1.Duration{Duration: 60 * time.Second},
+					WaitReadyTimeout: &metav1.Duration{
+						Duration: 30 * time.Second,
+					},
+					InplaceUpdate: &agentsv1alpha1.SandboxClaimInplaceUpdateOptions{
+						Resources: &agentsv1alpha1.SandboxClaimInplaceUpdateResourcesOptions{
+							Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("256Mi")},
+							Limits:   corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("256Mi")},
+						},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, qosBreakClaim)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, qosBreakClaim) }()
+
+			By("Verifying sandbox InplaceUpdate condition reports QoS change failure")
+			Eventually(func() string {
+				sbx := &agentsv1alpha1.Sandbox{}
+				if err := k8sClient.Get(ctx, types.NamespacedName{
+					Name:      warmName,
+					Namespace: namespace,
+				}, sbx); err != nil {
+					return ""
+				}
+				for _, cond := range sbx.Status.Conditions {
+					if cond.Type == string(agentsv1alpha1.SandboxConditionInplaceUpdate) &&
+						cond.Reason == agentsv1alpha1.SandboxInplaceUpdateReasonFailed {
+						return cond.Message
+					}
+				}
+				return ""
+			}, time.Minute*2, time.Second).Should(ContainSubstring("QoS"))
+
+			By("Verifying pod QoS class remains Burstable (resize was not applied)")
+			pod := &corev1.Pod{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{
+				Name:      warmName,
+				Namespace: namespace,
+			}, pod)).To(Succeed())
+			Expect(pod.Status.QOSClass).To(Equal(corev1.PodQOSBurstable))
+
+			By("Verifying spec resources remain at original values")
+			specRes := pod.Spec.Containers[0].Resources
+			Expect(specRes.Requests[corev1.ResourceMemory]).To(Equal(resource.MustParse("128Mi")))
+			Expect(specRes.Limits[corev1.ResourceMemory]).To(Equal(resource.MustParse("256Mi")))
+		})
+
+		It("should reject memory downscale and leave the pooled sandbox claimable", func() {
+			// Pool memory is 256Mi; the claim targets 128Mi, which is a memory
+			// downscale and must be rejected before any sandbox is locked.
+			downscaleSet := &agentsv1alpha1.SandboxSet{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      fmt.Sprintf("test-pool-memory-downscale-%d", time.Now().UnixNano()),
+					Namespace: namespace,
+				},
+				Spec: agentsv1alpha1.SandboxSetSpec{
+					Replicas: 1,
+					EmbeddedSandboxTemplate: agentsv1alpha1.EmbeddedSandboxTemplate{
+						Template: &corev1.PodTemplateSpec{
+							Spec: corev1.PodSpec{
+								Containers: []corev1.Container{{
+									Name:  "main",
+									Image: "nginx:stable-alpine3.23",
+									Resources: corev1.ResourceRequirements{
+										Requests: corev1.ResourceList{
+											corev1.ResourceCPU:    resource.MustParse("100m"),
+											corev1.ResourceMemory: resource.MustParse("256Mi"),
+										},
+										Limits: corev1.ResourceList{
+											corev1.ResourceCPU:    resource.MustParse("200m"),
+											corev1.ResourceMemory: resource.MustParse("256Mi"),
+										},
+									},
+								}},
+							},
+						},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, downscaleSet)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, downscaleSet) }()
+
+			By("Waiting for pool to be ready")
+			Eventually(func() int32 {
+				_ = k8sClient.Get(ctx, types.NamespacedName{
+					Name:      downscaleSet.Name,
+					Namespace: downscaleSet.Namespace,
+				}, downscaleSet)
+				return downscaleSet.Status.AvailableReplicas
+			}, time.Minute*2, time.Second).Should(Equal(int32(1)))
+
+			By("Recording the warm sandbox name")
+			var warmName string
+			Eventually(func() bool {
+				sandboxList := &agentsv1alpha1.SandboxList{}
+				if err := k8sClient.List(ctx, sandboxList, client.InNamespace(namespace), client.MatchingLabels{
+					agentsv1alpha1.LabelSandboxPool: downscaleSet.Name,
+				}); err != nil || len(sandboxList.Items) != 1 {
+					return false
+				}
+				warmName = sandboxList.Items[0].Name
+				return true
+			}, time.Minute, time.Second).Should(BeTrue())
+
+			By("Creating a SandboxClaim that downscales memory")
+			downscaleClaim := &agentsv1alpha1.SandboxClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      fmt.Sprintf("test-claim-memory-downscale-%d", time.Now().UnixNano()),
+					Namespace: namespace,
+				},
+				Spec: agentsv1alpha1.SandboxClaimSpec{
+					TemplateName:    downscaleSet.Name,
+					Replicas:        ptr.To(int32(1)),
+					SkipInitRuntime: true,
+					ClaimTimeout:    &metav1.Duration{Duration: 45 * time.Second},
+					WaitReadyTimeout: &metav1.Duration{
+						Duration: 30 * time.Second,
+					},
+					InplaceUpdate: &agentsv1alpha1.SandboxClaimInplaceUpdateOptions{
+						Resources: &agentsv1alpha1.SandboxClaimInplaceUpdateResourcesOptions{
+							Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("128Mi")},
+						},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, downscaleClaim)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, downscaleClaim) }()
+
+			By("Verifying the claim times out with zero claimed replicas")
+			Eventually(func() agentsv1alpha1.SandboxClaimPhase {
+				_ = k8sClient.Get(ctx, types.NamespacedName{
+					Name:      downscaleClaim.Name,
+					Namespace: downscaleClaim.Namespace,
+				}, downscaleClaim)
+				return downscaleClaim.Status.Phase
+			}, time.Minute*3, time.Second).Should(Equal(agentsv1alpha1.SandboxClaimPhaseCompleted))
+			Expect(downscaleClaim.Status.ClaimedReplicas).To(Equal(int32(0)))
+			timedOutCondFound := false
+			for _, cond := range downscaleClaim.Status.Conditions {
+				if cond.Type == string(agentsv1alpha1.SandboxClaimConditionTimedOut) && cond.Status == metav1.ConditionTrue {
+					timedOutCondFound = true
+					break
+				}
+			}
+			Expect(timedOutCondFound).To(BeTrue())
+
+			By("Verifying the sandbox stays unclaimed and pod memory is unchanged")
+			sbx := &agentsv1alpha1.Sandbox{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{
+				Name:      warmName,
+				Namespace: namespace,
+			}, sbx)).To(Succeed())
+			Expect(sbx.Annotations[agentsv1alpha1.AnnotationOwner]).To(BeEmpty())
+			pod := &corev1.Pod{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{
+				Name:      warmName,
+				Namespace: namespace,
+			}, pod)).To(Succeed())
+			Expect(pod.Spec.Containers[0].Resources.Requests[corev1.ResourceMemory]).To(Equal(resource.MustParse("256Mi")))
+		})
+
 	})
 
 	Context("Replicas immutability (webhook validation)", func() {

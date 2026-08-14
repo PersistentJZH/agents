@@ -18,6 +18,7 @@ package core
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/go-logr/logr"
@@ -470,6 +471,118 @@ func TestHandleInPlaceUpdateCommon_QoSChangeRejected(t *testing.T) {
 			}
 			if cond.Message == "" {
 				t.Error("Expected non-empty message about QoS change")
+			}
+		}
+	}
+	if !found {
+		t.Error("InplaceUpdate condition not found in status")
+	}
+}
+
+func TestHandleInPlaceUpdateCommon_MemoryDownscaleRejected(t *testing.T) {
+	ctx := context.Background()
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-pod",
+			Namespace: "default",
+			Labels: map[string]string{
+				agentsv1alpha1.PodLabelTemplateHash: "old-revision",
+			},
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{
+				Name:  "main",
+				Image: "nginx:latest",
+				Resources: corev1.ResourceRequirements{
+					Requests: corev1.ResourceList{
+						corev1.ResourceCPU:    resource.MustParse("250m"),
+						corev1.ResourceMemory: resource.MustParse("256Mi"),
+					},
+					Limits: corev1.ResourceList{
+						corev1.ResourceCPU:    resource.MustParse("500m"),
+						corev1.ResourceMemory: resource.MustParse("256Mi"),
+					},
+				},
+			}},
+		},
+	}
+
+	_, hashWithoutImageAndResource := HashSandbox(&agentsv1alpha1.Sandbox{
+		Spec: agentsv1alpha1.SandboxSpec{
+			EmbeddedSandboxTemplate: agentsv1alpha1.EmbeddedSandboxTemplate{
+				Template: &corev1.PodTemplateSpec{
+					Spec: pod.Spec,
+				},
+			},
+		},
+	})
+
+	// Sandbox template lowers memory 256Mi -> 128Mi; this is a downscale-only
+	// change that must be rejected instead of silently ignored.
+	box := &agentsv1alpha1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-sandbox",
+			Namespace: "default",
+			Annotations: map[string]string{
+				agentsv1alpha1.SandboxHashImmutablePart: hashWithoutImageAndResource,
+			},
+		},
+		Spec: agentsv1alpha1.SandboxSpec{
+			EmbeddedSandboxTemplate: agentsv1alpha1.EmbeddedSandboxTemplate{
+				Template: &corev1.PodTemplateSpec{
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{{
+							Name:  "main",
+							Image: "nginx:latest",
+							Resources: corev1.ResourceRequirements{
+								Requests: corev1.ResourceList{
+									corev1.ResourceCPU:    resource.MustParse("250m"),
+									corev1.ResourceMemory: resource.MustParse("128Mi"),
+								},
+								Limits: corev1.ResourceList{
+									corev1.ResourceCPU:    resource.MustParse("500m"),
+									corev1.ResourceMemory: resource.MustParse("128Mi"),
+								},
+							},
+						}},
+					},
+				},
+			},
+		},
+	}
+
+	newStatus := &agentsv1alpha1.SandboxStatus{
+		UpdateRevision: "new-revision",
+	}
+
+	recorder := createTestRecorder()
+	handler := &MockInPlaceUpdateHandler{
+		control:  inplaceupdate.NewInPlaceUpdateControl(nil, inplaceupdate.DefaultGeneratePatchBodyFunc),
+		recorder: recorder,
+		logger:   logr.Discard(),
+	}
+
+	result, err := handleInPlaceUpdateCommon(ctx, handler, pod, box, newStatus)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if !result {
+		t.Error("Expected result true (done, no requeue), got false")
+	}
+
+	var found bool
+	for _, cond := range newStatus.Conditions {
+		if cond.Type == string(agentsv1alpha1.SandboxConditionInplaceUpdate) {
+			found = true
+			if cond.Reason != agentsv1alpha1.SandboxInplaceUpdateReasonFailed {
+				t.Errorf("Expected reason %s, got %s", agentsv1alpha1.SandboxInplaceUpdateReasonFailed, cond.Reason)
+			}
+			if cond.Status != metav1.ConditionFalse {
+				t.Errorf("Expected status ConditionFalse, got %s", cond.Status)
+			}
+			if !strings.Contains(cond.Message, "downscale") {
+				t.Errorf("Expected message about memory downscale, got %q", cond.Message)
 			}
 		}
 	}
