@@ -317,11 +317,32 @@ func CheckResizeQoSChange(box *agentsv1alpha1.Sandbox, pod *corev1.Pod) (orig, u
 	return orig, updated, orig != updated
 }
 
+// CheckContainerMemoryDownscale returns an error when any target memory
+// request or limit in the given resource lists is lower than the container's
+// current memory. In-place memory downscale is not supported: a lower target
+// would otherwise be silently treated as satisfied by the relaxed resource
+// comparison used in the resize path.
+func CheckContainerMemoryDownscale(container *corev1.Container, requests, limits corev1.ResourceList) error {
+	if cur, ok := container.Resources.Requests[corev1.ResourceMemory]; ok && !cur.IsZero() {
+		if target, has := requests[corev1.ResourceMemory]; has && !target.IsZero() && target.Cmp(cur) < 0 {
+			return memoryDownscaleError("request", target, cur)
+		}
+	}
+	if cur, ok := container.Resources.Limits[corev1.ResourceMemory]; ok && !cur.IsZero() {
+		if target, has := limits[corev1.ResourceMemory]; has && !target.IsZero() && target.Cmp(cur) < 0 {
+			return memoryDownscaleError("limit", target, cur)
+		}
+	}
+	return nil
+}
+
+func memoryDownscaleError(kind string, target, cur resource.Quantity) error {
+	return fmt.Errorf("target memory %s %s must not be lower than the current value %s: in-place memory downscale is not supported", kind, target.String(), cur.String())
+}
+
 // CheckMemoryDownscale returns an error if applying the sandbox template
 // resources to the pod would lower any container's memory request or limit
-// below its current value. In-place memory downscale is not supported: a lower
-// target would otherwise be silently treated as satisfied by the relaxed
-// resource comparison used in the resize path.
+// below its current value.
 func CheckMemoryDownscale(box *agentsv1alpha1.Sandbox, pod *corev1.Pod) error {
 	if box.Spec.Template == nil {
 		return nil
@@ -333,15 +354,8 @@ func CheckMemoryDownscale(box *agentsv1alpha1.Sandbox, pod *corev1.Pod) error {
 		if !ok {
 			continue
 		}
-		if cur, ok := container.Resources.Requests[corev1.ResourceMemory]; ok && !cur.IsZero() {
-			if target, has := desired.Resources.Requests[corev1.ResourceMemory]; has && !target.IsZero() && target.Cmp(cur) < 0 {
-				return fmt.Errorf("in-place memory downscale is not supported: container %q memory request %s is lower than the current value %s", container.Name, target.String(), cur.String())
-			}
-		}
-		if cur, ok := container.Resources.Limits[corev1.ResourceMemory]; ok && !cur.IsZero() {
-			if target, has := desired.Resources.Limits[corev1.ResourceMemory]; has && !target.IsZero() && target.Cmp(cur) < 0 {
-				return fmt.Errorf("in-place memory downscale is not supported: container %q memory limit %s is lower than the current value %s", container.Name, target.String(), cur.String())
-			}
+		if err := CheckContainerMemoryDownscale(container, desired.Resources.Requests, desired.Resources.Limits); err != nil {
+			return fmt.Errorf("container %q: %w", container.Name, err)
 		}
 	}
 	return nil

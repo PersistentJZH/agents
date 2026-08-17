@@ -2733,13 +2733,13 @@ func TestCheckMemoryDownscale(t *testing.T) {
 			name:        "lower memory request rejected",
 			box:         boxWithMemory("128Mi", "512Mi"),
 			pod:         podWithMemory("256Mi", "512Mi"),
-			expectError: "memory request 128Mi is lower than the current value 256Mi",
+			expectError: "target memory request 128Mi must not be lower than the current value 256Mi",
 		},
 		{
 			name:        "lower memory limit rejected",
 			box:         boxWithMemory("256Mi", "256Mi"),
 			pod:         podWithMemory("256Mi", "512Mi"),
-			expectError: "memory limit 256Mi is lower than the current value 512Mi",
+			expectError: "target memory limit 256Mi must not be lower than the current value 512Mi",
 		},
 		{
 			name: "upscale accepted",

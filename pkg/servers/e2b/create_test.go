@@ -1033,6 +1033,38 @@ func TestCreateSandbox_MemoryOverridePropagatedToClaimedSandbox(t *testing.T) {
 	assert.Equal(t, resource.MustParse("100m"), resources.Requests[corev1.ResourceCPU])
 }
 
+func TestCreateSandbox_InvalidResourceOverrideReturns400(t *testing.T) {
+	fakeQuota := &fakeQuotaManager{}
+	controller, _, teardown := SetupWithQuota(t, fakeQuota)
+	defer teardown()
+
+	cleanup := CreateSandboxPool(t, controller, "invalid-override-tmpl", 1, CreateSandboxPoolOptions{
+		CPURequest: "100m",
+		Memory:     "256Mi",
+	})
+	defer cleanup()
+
+	user := quotaLimitedUser([]quotaspec.QuotaLimit{{
+		Dimension: quotaspec.DimSandboxCount,
+		Scope:     quotaspec.ScopeRunning,
+		Limit:     10,
+	}})
+	// A memory downscale is client input error and must map to HTTP 400,
+	// not 500, and must not lock or consume the pooled sandbox.
+	resp, apiErr := controller.CreateSandbox(NewRequest(t, nil, models.NewSandboxRequest{
+		TemplateID: "invalid-override-tmpl",
+		Metadata: map[string]string{
+			models.ExtensionKeySkipInitRuntime:        v1alpha1.True,
+			models.ExtensionKeyClaimWithMemoryRequest: "128Mi",
+		},
+	}, nil, user))
+
+	require.NotNil(t, apiErr)
+	assert.Equal(t, http.StatusBadRequest, apiErr.Code)
+	assert.Contains(t, apiErr.Message, "downscale")
+	assert.Zero(t, resp.Code)
+}
+
 func quotaLimitedUser(limits []quotaspec.QuotaLimit) *models.CreatedTeamAPIKey {
 	return &models.CreatedTeamAPIKey{
 		ID:   uuid.New(),

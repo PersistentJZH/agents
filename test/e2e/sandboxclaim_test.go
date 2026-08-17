@@ -1989,6 +1989,16 @@ var _ = Describe("SandboxClaim", func() {
 			specRes := pod.Spec.Containers[0].Resources
 			Expect(specRes.Requests[corev1.ResourceMemory]).To(Equal(resource.MustParse("128Mi")))
 			Expect(specRes.Limits[corev1.ResourceMemory]).To(Equal(resource.MustParse("256Mi")))
+
+			By("Verifying the claim completes with the claimed sandbox")
+			Eventually(func() agentsv1alpha1.SandboxClaimPhase {
+				_ = k8sClient.Get(ctx, types.NamespacedName{
+					Name:      qosBreakClaim.Name,
+					Namespace: qosBreakClaim.Namespace,
+				}, qosBreakClaim)
+				return qosBreakClaim.Status.Phase
+			}, time.Minute*2, time.Second).Should(Equal(agentsv1alpha1.SandboxClaimPhaseCompleted))
+			Expect(qosBreakClaim.Status.ClaimedReplicas).To(Equal(int32(1)))
 		})
 
 		It("should reject memory downscale and leave the pooled sandbox claimable", func() {
@@ -2072,23 +2082,25 @@ var _ = Describe("SandboxClaim", func() {
 			Expect(k8sClient.Create(ctx, downscaleClaim)).To(Succeed())
 			defer func() { _ = k8sClient.Delete(ctx, downscaleClaim) }()
 
-			By("Verifying the claim times out with zero claimed replicas")
+			By("Verifying the claim fails fast with MemoryDownscaleNotSupported")
 			Eventually(func() agentsv1alpha1.SandboxClaimPhase {
 				_ = k8sClient.Get(ctx, types.NamespacedName{
 					Name:      downscaleClaim.Name,
 					Namespace: downscaleClaim.Namespace,
 				}, downscaleClaim)
 				return downscaleClaim.Status.Phase
-			}, time.Minute*3, time.Second).Should(Equal(agentsv1alpha1.SandboxClaimPhaseCompleted))
+			}, time.Minute*2, time.Second).Should(Equal(agentsv1alpha1.SandboxClaimPhaseCompleted))
 			Expect(downscaleClaim.Status.ClaimedReplicas).To(Equal(int32(0)))
-			timedOutCondFound := false
+			downscaleCondFound := false
 			for _, cond := range downscaleClaim.Status.Conditions {
-				if cond.Type == string(agentsv1alpha1.SandboxClaimConditionTimedOut) && cond.Status == metav1.ConditionTrue {
-					timedOutCondFound = true
+				if cond.Type == string(agentsv1alpha1.SandboxClaimConditionCompleted) &&
+					cond.Status == metav1.ConditionTrue &&
+					cond.Reason == "MemoryDownscaleNotSupported" {
+					downscaleCondFound = true
 					break
 				}
 			}
-			Expect(timedOutCondFound).To(BeTrue())
+			Expect(downscaleCondFound).To(BeTrue())
 
 			By("Verifying the sandbox stays unclaimed and pod memory is unchanged")
 			sbx := &agentsv1alpha1.Sandbox{}
@@ -2097,6 +2109,7 @@ var _ = Describe("SandboxClaim", func() {
 				Namespace: namespace,
 			}, sbx)).To(Succeed())
 			Expect(sbx.Annotations[agentsv1alpha1.AnnotationOwner]).To(BeEmpty())
+			Expect(sbx.Labels[agentsv1alpha1.LabelSandboxIsClaimed]).NotTo(Equal(agentsv1alpha1.True))
 			pod := &corev1.Pod{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{
 				Name:      warmName,

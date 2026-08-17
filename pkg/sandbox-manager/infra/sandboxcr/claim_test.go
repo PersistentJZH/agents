@@ -1989,6 +1989,9 @@ func TestBuildResourceResizedPod_MemoryDownscaleRejected(t *testing.T) {
 			if tt.expectError != "" {
 				require.Error(t, err)
 				assert.Contains(t, err.Error(), tt.expectError)
+				// Downscale rejection is a client input error and must carry
+				// ErrorBadRequest so the E2B API maps it to HTTP 400.
+				assert.Equal(t, managererrors.ErrorBadRequest, managererrors.GetErrCode(err))
 				return
 			}
 			require.NoError(t, err)
@@ -2069,6 +2072,9 @@ func TestValidateAndInitClaimOptions_ResourceResize(t *testing.T) {
 			if tt.expectError != "" {
 				require.Error(t, err)
 				assert.Contains(t, err.Error(), tt.expectError)
+				// Validation failures are client input errors and must carry
+				// ErrorBadRequest so the E2B API maps them to HTTP 400.
+				assert.Equal(t, managererrors.ErrorBadRequest, managererrors.GetErrCode(err))
 				return
 			}
 			require.NoError(t, err)

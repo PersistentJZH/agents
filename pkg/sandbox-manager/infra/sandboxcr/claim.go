@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand/v2"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -44,12 +45,14 @@ import (
 	"github.com/openkruise/agents/pkg/identity"
 	"github.com/openkruise/agents/pkg/sandbox-manager/config"
 	"github.com/openkruise/agents/pkg/sandbox-manager/consts"
+	managererrors "github.com/openkruise/agents/pkg/sandbox-manager/errors"
 	"github.com/openkruise/agents/pkg/sandbox-manager/infra"
 	"github.com/openkruise/agents/pkg/sandbox-manager/logs"
 	"github.com/openkruise/agents/pkg/servers/e2b/models"
 	"github.com/openkruise/agents/pkg/tracing"
 	"github.com/openkruise/agents/pkg/utils"
 	"github.com/openkruise/agents/pkg/utils/expectations"
+	"github.com/openkruise/agents/pkg/utils/inplaceupdate"
 	"github.com/openkruise/agents/pkg/utils/runtime"
 	timeoututils "github.com/openkruise/agents/pkg/utils/timeout"
 
@@ -104,46 +107,70 @@ func ValidateAndInitClaimOptions(opts infra.ClaimSandboxOptions) (infra.ClaimSan
 	return opts, nil
 }
 
-// validateInplaceUpdateResources validates in-place update resource targets.
-// Unsupported resource names are rejected, values must be positive, and
-// requests must not exceed limits. Validation runs in a fixed order so error
-// messages are deterministic regardless of map iteration order.
+// validateInplaceUpdateResources validates in-place update resource targets
+// through the shared ValidateResizeResources.
 func validateInplaceUpdateResources(inplace *config.InplaceUpdateOptions) error {
 	if inplace == nil || inplace.Resources == nil {
 		return nil
 	}
-	res := inplace.Resources
-	if len(res.Requests) == 0 && len(res.Limits) == 0 {
-		return fmt.Errorf("resources must specify at least one of requests or limits")
+	return ValidateResizeResources(inplace.Resources.Requests, inplace.Resources.Limits)
+}
+
+// ValidateResizeResources validates in-place resize targets shared by the E2B
+// create path and the SandboxClaim controller. Unsupported resource names are
+// rejected, values must be positive, and requests must not exceed limits.
+// Validation runs in a fixed order so error messages are deterministic
+// regardless of map iteration order. All returned errors are classified as
+// ErrorBadRequest so callers map them to HTTP 400.
+func ValidateResizeResources(requests, limits corev1.ResourceList) error {
+	if len(requests) == 0 && len(limits) == 0 {
+		return managererrors.NewError(managererrors.ErrorBadRequest, "resources must specify at least one of requests or limits")
 	}
-	for name := range res.Requests {
-		if !supportedResizeResources[name] {
-			return fmt.Errorf("resource %s is not supported for in-place resize", name)
-		}
-	}
-	for name := range res.Limits {
-		if !supportedResizeResources[name] {
-			return fmt.Errorf("resource %s is not supported for in-place resize", name)
-		}
+	unknown := unsupportedResourceNames(requests, limits)
+	if len(unknown) > 0 {
+		return managererrors.NewError(managererrors.ErrorBadRequest, "resource %s is not supported for in-place resize", unknown[0])
 	}
 	for _, name := range []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory} {
-		if quantity, ok := res.Requests[name]; ok {
+		if quantity, ok := requests[name]; ok {
 			if quantity.IsZero() || quantity.Cmp(resource.Quantity{}) < 0 {
-				return fmt.Errorf("target %s must be a positive value", name)
+				return managererrors.NewError(managererrors.ErrorBadRequest, "target %s must be a positive value", name)
 			}
 		}
-		if quantity, ok := res.Limits[name]; ok {
+		if quantity, ok := limits[name]; ok {
 			if quantity.IsZero() || quantity.Cmp(resource.Quantity{}) < 0 {
-				return fmt.Errorf("target %s must be a positive value", name)
+				return managererrors.NewError(managererrors.ErrorBadRequest, "target %s must be a positive value", name)
 			}
 		}
-		req, hasReq := res.Requests[name]
-		lim, hasLim := res.Limits[name]
+		req, hasReq := requests[name]
+		lim, hasLim := limits[name]
 		if hasReq && hasLim && req.Cmp(lim) > 0 {
-			return fmt.Errorf("target %s request %s must not exceed limit %s", name, req.String(), lim.String())
+			return managererrors.NewError(managererrors.ErrorBadRequest, "target %s request %s must not exceed limit %s", name, req.String(), lim.String())
 		}
 	}
 	return nil
+}
+
+// unsupportedResourceNames returns the sorted resource names present in the
+// given lists that are not allowed for in-place resize, so the reported name
+// is deterministic even with several invalid keys.
+func unsupportedResourceNames(requests, limits corev1.ResourceList) []corev1.ResourceName {
+	seen := make(map[corev1.ResourceName]struct{}, len(requests)+len(limits))
+	for name := range requests {
+		if !supportedResizeResources[name] {
+			seen[name] = struct{}{}
+		}
+	}
+	for name := range limits {
+		if !supportedResizeResources[name] {
+			seen[name] = struct{}{}
+		}
+	}
+	names := make([]corev1.ResourceName, 0, len(seen))
+	for name := range seen {
+		names = append(names, name)
+	}
+	sort.Slice(names, func(i, j int) bool { return names[i] < names[j] })
+	return names
 }
 
 // chooseLockString returns the lock string to use for the current attempt.
@@ -745,7 +772,7 @@ func modifyPickedSandbox(sbx *Sandbox, lockType infra.LockType, opts infra.Claim
 		}
 		if opts.InplaceUpdate.Resources != nil {
 			if err := sbx.SetResources(opts.InplaceUpdate.Resources.Requests, opts.InplaceUpdate.Resources.Limits); err != nil {
-				return terminalMutationError{stage: "inplace update", err: err}
+				return terminalValidationError{err: err}
 			}
 		}
 	}
@@ -882,12 +909,16 @@ var supportedResizeResources = map[corev1.ResourceName]bool{
 }
 
 // setContainerResources updates the container's requests and limits for resources
-// listed in supportedResizeResources. Unsupported resource types are silently ignored.
+// listed in supportedResizeResources. Unsupported resource types are skipped at
+// this layer; callers must validate targets with ValidateResizeResources first.
 // A resource is also skipped if it was not originally set on the container.
 // Memory may only be increased: a target memory request or limit lower than the
-// container's current value returns an error because in-place memory downscale
-// is not supported.
+// container's current value returns a BadRequest error because in-place memory
+// downscale is not supported.
 func setContainerResources(container *corev1.Container, requests, limits corev1.ResourceList) (bool, error) {
+	if err := inplaceupdate.CheckContainerMemoryDownscale(container, requests, limits); err != nil {
+		return false, managererrors.WrapError(managererrors.ErrorBadRequest, err, "%s", err.Error())
+	}
 	changed := false
 	for resName, target := range requests {
 		if !supportedResizeResources[resName] {
@@ -896,9 +927,6 @@ func setContainerResources(container *corev1.Container, requests, limits corev1.
 		cur, ok := container.Resources.Requests[resName]
 		if !ok || cur.IsZero() {
 			continue
-		}
-		if resName == corev1.ResourceMemory && target.Cmp(cur) < 0 {
-			return false, fmt.Errorf("target memory request %s must not be lower than the current value %s: in-place memory downscale is not supported", target.String(), cur.String())
 		}
 		if container.Resources.Requests == nil {
 			container.Resources.Requests = corev1.ResourceList{}
@@ -913,9 +941,6 @@ func setContainerResources(container *corev1.Container, requests, limits corev1.
 		cur, ok := container.Resources.Limits[resName]
 		if !ok || cur.IsZero() {
 			continue
-		}
-		if resName == corev1.ResourceMemory && target.Cmp(cur) < 0 {
-			return false, fmt.Errorf("target memory limit %s must not be lower than the current value %s: in-place memory downscale is not supported", target.String(), cur.String())
 		}
 		if container.Resources.Limits == nil {
 			container.Resources.Limits = corev1.ResourceList{}

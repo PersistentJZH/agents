@@ -479,8 +479,39 @@ func TestHandleInPlaceUpdateCommon_QoSChangeRejected(t *testing.T) {
 	}
 }
 
-func TestHandleInPlaceUpdateCommon_MemoryDownscaleRejected(t *testing.T) {
+func TestHandleInPlaceUpdateCommon_MemoryDownscaleSkippedAdvisory(t *testing.T) {
+	// The pod's live memory (256Mi) was raised above the template (128Mi) by
+	// the environment. A memory downscale must NOT hard-fail the rollout:
+	// the image update proceeds and only an advisory event is emitted.
 	ctx := context.Background()
+
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = agentsv1alpha1.AddToScheme(scheme)
+
+	oldPodSpec := corev1.PodSpec{
+		Containers: []corev1.Container{{
+			Name:  "main",
+			Image: "nginx:old",
+			Resources: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("256Mi")},
+				Limits:   corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("256Mi")},
+			},
+		}},
+	}
+
+	newPodSpec := corev1.PodSpec{
+		Containers: []corev1.Container{{
+			Name:  "main",
+			Image: "nginx:new",
+			Resources: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("128Mi")},
+				Limits:   corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("128Mi")},
+			},
+		}},
+	}
+
+	box := buildMatchingHashBox("test-sandbox", "default", newPodSpec)
 
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
@@ -490,67 +521,10 @@ func TestHandleInPlaceUpdateCommon_MemoryDownscaleRejected(t *testing.T) {
 				agentsv1alpha1.PodLabelTemplateHash: "old-revision",
 			},
 		},
-		Spec: corev1.PodSpec{
-			Containers: []corev1.Container{{
-				Name:  "main",
-				Image: "nginx:latest",
-				Resources: corev1.ResourceRequirements{
-					Requests: corev1.ResourceList{
-						corev1.ResourceCPU:    resource.MustParse("250m"),
-						corev1.ResourceMemory: resource.MustParse("256Mi"),
-					},
-					Limits: corev1.ResourceList{
-						corev1.ResourceCPU:    resource.MustParse("500m"),
-						corev1.ResourceMemory: resource.MustParse("256Mi"),
-					},
-				},
-			}},
-		},
+		Spec: oldPodSpec,
 	}
 
-	_, hashWithoutImageAndResource := HashSandbox(&agentsv1alpha1.Sandbox{
-		Spec: agentsv1alpha1.SandboxSpec{
-			EmbeddedSandboxTemplate: agentsv1alpha1.EmbeddedSandboxTemplate{
-				Template: &corev1.PodTemplateSpec{
-					Spec: pod.Spec,
-				},
-			},
-		},
-	})
-
-	// Sandbox template lowers memory 256Mi -> 128Mi; this is a downscale-only
-	// change that must be rejected instead of silently ignored.
-	box := &agentsv1alpha1.Sandbox{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test-sandbox",
-			Namespace: "default",
-			Annotations: map[string]string{
-				agentsv1alpha1.SandboxHashImmutablePart: hashWithoutImageAndResource,
-			},
-		},
-		Spec: agentsv1alpha1.SandboxSpec{
-			EmbeddedSandboxTemplate: agentsv1alpha1.EmbeddedSandboxTemplate{
-				Template: &corev1.PodTemplateSpec{
-					Spec: corev1.PodSpec{
-						Containers: []corev1.Container{{
-							Name:  "main",
-							Image: "nginx:latest",
-							Resources: corev1.ResourceRequirements{
-								Requests: corev1.ResourceList{
-									corev1.ResourceCPU:    resource.MustParse("250m"),
-									corev1.ResourceMemory: resource.MustParse("128Mi"),
-								},
-								Limits: corev1.ResourceList{
-									corev1.ResourceCPU:    resource.MustParse("500m"),
-									corev1.ResourceMemory: resource.MustParse("128Mi"),
-								},
-							},
-						}},
-					},
-				},
-			},
-		},
-	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod).Build()
 
 	newStatus := &agentsv1alpha1.SandboxStatus{
 		UpdateRevision: "new-revision",
@@ -558,7 +532,7 @@ func TestHandleInPlaceUpdateCommon_MemoryDownscaleRejected(t *testing.T) {
 
 	recorder := createTestRecorder()
 	handler := &MockInPlaceUpdateHandler{
-		control:  inplaceupdate.NewInPlaceUpdateControl(nil, inplaceupdate.DefaultGeneratePatchBodyFunc),
+		control:  inplaceupdate.NewInPlaceUpdateControl(fakeClient, inplaceupdate.DefaultGeneratePatchBodyFunc),
 		recorder: recorder,
 		logger:   logr.Discard(),
 	}
@@ -567,27 +541,30 @@ func TestHandleInPlaceUpdateCommon_MemoryDownscaleRejected(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
-	if !result {
-		t.Error("Expected result true (done, no requeue), got false")
+	if result {
+		t.Error("Expected result false (update in progress), got true")
 	}
 
-	var found bool
+	// The image rollout must proceed: condition is InplaceUpdating, not Failed.
 	for _, cond := range newStatus.Conditions {
-		if cond.Type == string(agentsv1alpha1.SandboxConditionInplaceUpdate) {
+		if cond.Type != string(agentsv1alpha1.SandboxConditionInplaceUpdate) {
+			continue
+		}
+		if cond.Reason == agentsv1alpha1.SandboxInplaceUpdateReasonFailed {
+			t.Errorf("Expected no InplaceUpdate failure, got reason %s message %q", cond.Reason, cond.Message)
+		}
+	}
+
+	// An advisory event about the skipped downscale must be recorded.
+	fakeRecorder := recorder.(*record.FakeRecorder)
+	found := false
+	for len(fakeRecorder.Events) > 0 {
+		if ev := <-fakeRecorder.Events; strings.Contains(ev, "MemoryDownscaleSkipped") {
 			found = true
-			if cond.Reason != agentsv1alpha1.SandboxInplaceUpdateReasonFailed {
-				t.Errorf("Expected reason %s, got %s", agentsv1alpha1.SandboxInplaceUpdateReasonFailed, cond.Reason)
-			}
-			if cond.Status != metav1.ConditionFalse {
-				t.Errorf("Expected status ConditionFalse, got %s", cond.Status)
-			}
-			if !strings.Contains(cond.Message, "downscale") {
-				t.Errorf("Expected message about memory downscale, got %q", cond.Message)
-			}
 		}
 	}
 	if !found {
-		t.Error("InplaceUpdate condition not found in status")
+		t.Error("Expected MemoryDownscaleSkipped event, none recorded")
 	}
 }
 
