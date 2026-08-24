@@ -484,25 +484,31 @@ var _ = Describe("SandboxClaim", func() {
 			Expect(k8sClient.Create(ctx, qosBreakClaim)).To(Succeed())
 			defer func() { _ = k8sClient.Delete(ctx, qosBreakClaim) }()
 
-			By("Verifying sandbox InplaceUpdate condition reports QoS change failure")
-			Eventually(func() string {
-				sbx := &agentsv1alpha1.Sandbox{}
-				if err := k8sClient.Get(ctx, types.NamespacedName{
-					Name:      warmName,
-					Namespace: namespace,
-				}, sbx); err != nil {
-					return ""
+			By("Verifying the claim completes by timeout with zero claimed replicas")
+			Eventually(func() agentsv1alpha1.SandboxClaimPhase {
+				_ = k8sClient.Get(ctx, types.NamespacedName{
+					Name:      qosBreakClaim.Name,
+					Namespace: qosBreakClaim.Namespace,
+				}, qosBreakClaim)
+				return qosBreakClaim.Status.Phase
+			}, time.Minute*2, time.Second).Should(Equal(agentsv1alpha1.SandboxClaimPhaseCompleted))
+			Expect(qosBreakClaim.Status.ClaimedReplicas).To(Equal(int32(0)))
+			timedOutCondFound := false
+			for _, cond := range qosBreakClaim.Status.Conditions {
+				if cond.Type == string(agentsv1alpha1.SandboxClaimConditionTimedOut) && cond.Status == metav1.ConditionTrue {
+					timedOutCondFound = true
+					break
 				}
-				for _, cond := range sbx.Status.Conditions {
-					if cond.Type == string(agentsv1alpha1.SandboxConditionInplaceUpdate) &&
-						cond.Reason == agentsv1alpha1.SandboxInplaceUpdateReasonFailed {
-						return cond.Message
-					}
-				}
-				return ""
-			}, time.Minute*2, time.Second).Should(ContainSubstring("QoS"))
+			}
+			Expect(timedOutCondFound).To(BeTrue())
 
-			By("Verifying pod QoS class remains Burstable (resize was not applied)")
+			By("Verifying the sandbox stays unclaimed and pod QoS class remains Burstable")
+			sbx := &agentsv1alpha1.Sandbox{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{
+				Name:      warmName,
+				Namespace: namespace,
+			}, sbx)).To(Succeed())
+			Expect(sbx.Annotations[agentsv1alpha1.AnnotationOwner]).To(BeEmpty())
 			pod := &corev1.Pod{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{
 				Name:      warmName,
@@ -1959,25 +1965,31 @@ var _ = Describe("SandboxClaim", func() {
 			Expect(k8sClient.Create(ctx, qosBreakClaim)).To(Succeed())
 			defer func() { _ = k8sClient.Delete(ctx, qosBreakClaim) }()
 
-			By("Verifying sandbox InplaceUpdate condition reports QoS change failure")
-			Eventually(func() string {
-				sbx := &agentsv1alpha1.Sandbox{}
-				if err := k8sClient.Get(ctx, types.NamespacedName{
-					Name:      warmName,
-					Namespace: namespace,
-				}, sbx); err != nil {
-					return ""
+			By("Verifying the claim completes by timeout with zero claimed replicas")
+			Eventually(func() agentsv1alpha1.SandboxClaimPhase {
+				_ = k8sClient.Get(ctx, types.NamespacedName{
+					Name:      qosBreakClaim.Name,
+					Namespace: qosBreakClaim.Namespace,
+				}, qosBreakClaim)
+				return qosBreakClaim.Status.Phase
+			}, time.Minute*2, time.Second).Should(Equal(agentsv1alpha1.SandboxClaimPhaseCompleted))
+			Expect(qosBreakClaim.Status.ClaimedReplicas).To(Equal(int32(0)))
+			timedOutCondFound := false
+			for _, cond := range qosBreakClaim.Status.Conditions {
+				if cond.Type == string(agentsv1alpha1.SandboxClaimConditionTimedOut) && cond.Status == metav1.ConditionTrue {
+					timedOutCondFound = true
+					break
 				}
-				for _, cond := range sbx.Status.Conditions {
-					if cond.Type == string(agentsv1alpha1.SandboxConditionInplaceUpdate) &&
-						cond.Reason == agentsv1alpha1.SandboxInplaceUpdateReasonFailed {
-						return cond.Message
-					}
-				}
-				return ""
-			}, time.Minute*2, time.Second).Should(ContainSubstring("QoS"))
+			}
+			Expect(timedOutCondFound).To(BeTrue())
 
-			By("Verifying pod QoS class remains Burstable (resize was not applied)")
+			By("Verifying the sandbox stays unclaimed and pod QoS class remains Burstable")
+			sbx := &agentsv1alpha1.Sandbox{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{
+				Name:      warmName,
+				Namespace: namespace,
+			}, sbx)).To(Succeed())
+			Expect(sbx.Annotations[agentsv1alpha1.AnnotationOwner]).To(BeEmpty())
 			pod := &corev1.Pod{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{
 				Name:      warmName,
@@ -1989,16 +2001,6 @@ var _ = Describe("SandboxClaim", func() {
 			specRes := pod.Spec.Containers[0].Resources
 			Expect(specRes.Requests[corev1.ResourceMemory]).To(Equal(resource.MustParse("128Mi")))
 			Expect(specRes.Limits[corev1.ResourceMemory]).To(Equal(resource.MustParse("256Mi")))
-
-			By("Verifying the claim completes with the claimed sandbox")
-			Eventually(func() agentsv1alpha1.SandboxClaimPhase {
-				_ = k8sClient.Get(ctx, types.NamespacedName{
-					Name:      qosBreakClaim.Name,
-					Namespace: qosBreakClaim.Namespace,
-				}, qosBreakClaim)
-				return qosBreakClaim.Status.Phase
-			}, time.Minute*2, time.Second).Should(Equal(agentsv1alpha1.SandboxClaimPhaseCompleted))
-			Expect(qosBreakClaim.Status.ClaimedReplicas).To(Equal(int32(1)))
 		})
 
 		It("should reject memory downscale and leave the pooled sandbox claimable", func() {
@@ -2082,7 +2084,7 @@ var _ = Describe("SandboxClaim", func() {
 			Expect(k8sClient.Create(ctx, downscaleClaim)).To(Succeed())
 			defer func() { _ = k8sClient.Delete(ctx, downscaleClaim) }()
 
-			By("Verifying the claim fails fast with MemoryDownscaleNotSupported")
+			By("Verifying the claim completes by timeout with zero claimed replicas")
 			Eventually(func() agentsv1alpha1.SandboxClaimPhase {
 				_ = k8sClient.Get(ctx, types.NamespacedName{
 					Name:      downscaleClaim.Name,
@@ -2091,16 +2093,14 @@ var _ = Describe("SandboxClaim", func() {
 				return downscaleClaim.Status.Phase
 			}, time.Minute*2, time.Second).Should(Equal(agentsv1alpha1.SandboxClaimPhaseCompleted))
 			Expect(downscaleClaim.Status.ClaimedReplicas).To(Equal(int32(0)))
-			downscaleCondFound := false
+			timedOutCondFound := false
 			for _, cond := range downscaleClaim.Status.Conditions {
-				if cond.Type == string(agentsv1alpha1.SandboxClaimConditionCompleted) &&
-					cond.Status == metav1.ConditionTrue &&
-					cond.Reason == "MemoryDownscaleNotSupported" {
-					downscaleCondFound = true
+				if cond.Type == string(agentsv1alpha1.SandboxClaimConditionTimedOut) && cond.Status == metav1.ConditionTrue {
+					timedOutCondFound = true
 					break
 				}
 			}
-			Expect(downscaleCondFound).To(BeTrue())
+			Expect(timedOutCondFound).To(BeTrue())
 
 			By("Verifying the sandbox stays unclaimed and pod memory is unchanged")
 			sbx := &agentsv1alpha1.Sandbox{}

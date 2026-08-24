@@ -450,7 +450,7 @@ func TestInfra_ClaimSandbox(t *testing.T) {
 						},
 						Limits: corev1.ResourceList{
 							corev1.ResourceCPU:    resource.MustParse("1"),
-							corev1.ResourceMemory: resource.MustParse("1Gi"),
+							corev1.ResourceMemory: resource.MustParse("768Mi"),
 						},
 					},
 				},
@@ -476,8 +476,39 @@ func TestInfra_ClaimSandbox(t *testing.T) {
 				assert.Equal(t, resource.MustParse("1"), container.Resources.Requests[corev1.ResourceCPU])
 				assert.Equal(t, resource.MustParse("768Mi"), container.Resources.Requests[corev1.ResourceMemory])
 				assert.Equal(t, resource.MustParse("1"), container.Resources.Limits[corev1.ResourceCPU])
-				assert.Equal(t, resource.MustParse("1Gi"), container.Resources.Limits[corev1.ResourceMemory])
+				assert.Equal(t, resource.MustParse("768Mi"), container.Resources.Limits[corev1.ResourceMemory])
 			},
+		},
+		{
+			name:      "claim with qos breaking resource resize rejected",
+			available: 1,
+			options: infra.ClaimSandboxOptions{
+				User:     user,
+				Template: existTemplate,
+				InplaceUpdate: &config.InplaceUpdateOptions{
+					Resources: &config.InplaceUpdateResourcesOptions{
+						Limits: corev1.ResourceList{
+							corev1.ResourceCPU:    resource.MustParse("1"),
+							corev1.ResourceMemory: resource.MustParse("1Gi"),
+						},
+					},
+				},
+			},
+			preModifier: func(sbx *v1alpha1.Sandbox, infra *Infra) {
+				reqCPU := resource.MustParse("500m")
+				reqMem := resource.MustParse("512Mi")
+				sbx.Spec.Template.Spec.Containers[0].Resources = corev1.ResourceRequirements{
+					Requests: corev1.ResourceList{
+						corev1.ResourceCPU:    reqCPU,
+						corev1.ResourceMemory: reqMem,
+					},
+					Limits: corev1.ResourceList{
+						corev1.ResourceCPU:    reqCPU,
+						corev1.ResourceMemory: reqMem,
+					},
+				}
+			},
+			expectError: "QoS class",
 		},
 		{
 			name:      "claim with csi mount",
@@ -1670,7 +1701,7 @@ func TestModifyPickedSandboxMemoryResizeCases(t *testing.T) {
 	}
 }
 
-func TestModifyPickedSandboxCPUNilTemplate(t *testing.T) {
+func TestModifyPickedSandboxResizeNilTemplateRejected(t *testing.T) {
 	sbx := &Sandbox{
 		Sandbox: &v1alpha1.Sandbox{
 			ObjectMeta: metav1.ObjectMeta{
@@ -1687,6 +1718,8 @@ func TestModifyPickedSandboxCPUNilTemplate(t *testing.T) {
 		},
 	}
 
+	// Resizing a sandbox without a pod template must fail instead of claiming
+	// it unchanged.
 	err := modifyPickedSandbox(sbx, infra.LockTypeUpdate, infra.ClaimSandboxOptions{
 		User:     "u1",
 		Template: "test-template",
@@ -1697,7 +1730,8 @@ func TestModifyPickedSandboxCPUNilTemplate(t *testing.T) {
 			},
 		},
 	})
-	require.NoError(t, err)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no pod template")
 	assert.Nil(t, sbx.Spec.Template)
 }
 
@@ -2049,14 +2083,24 @@ func TestValidateAndInitClaimOptions_ResourceResize(t *testing.T) {
 			resources: &config.InplaceUpdateResourcesOptions{
 				Requests: corev1.ResourceList{"nvidia.com/gpu": resource.MustParse("1")},
 			},
-			expectError: "resource nvidia.com/gpu is not supported for in-place resize",
+			expectError: "resources nvidia.com/gpu are not supported for in-place resize",
 		},
 		{
 			name: "unknown limit resource rejected",
 			resources: &config.InplaceUpdateResourcesOptions{
 				Limits: corev1.ResourceList{corev1.ResourceEphemeralStorage: resource.MustParse("1Gi")},
 			},
-			expectError: "resource ephemeral-storage is not supported for in-place resize",
+			expectError: "resources ephemeral-storage are not supported for in-place resize",
+		},
+		{
+			name: "multiple unknown resources all listed",
+			resources: &config.InplaceUpdateResourcesOptions{
+				Requests: corev1.ResourceList{
+					"nvidia.com/gpu": resource.MustParse("1"),
+					"hugepages-2Mi":  resource.MustParse("1Gi"),
+				},
+			},
+			expectError: "resources hugepages-2Mi, nvidia.com/gpu are not supported for in-place resize",
 		},
 	}
 
@@ -4184,6 +4228,310 @@ func TestPickAnAvailableSandbox_PrefersMatchingRevision(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestPreCheckCandidateResizeCompatibility(t *testing.T) {
+	utestutils.InitLogOutput()
+
+	memContainer := func(req, lim string) corev1.Container {
+		c := corev1.Container{Name: "main", Resources: corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{},
+			Limits:   corev1.ResourceList{},
+		}}
+		if req != "" {
+			c.Resources.Requests[corev1.ResourceMemory] = resource.MustParse(req)
+		}
+		if lim != "" {
+			c.Resources.Limits[corev1.ResourceMemory] = resource.MustParse(lim)
+		}
+		return c
+	}
+	qosContainer := func(reqCPU, reqMem, limCPU, limMem string) corev1.Container {
+		return corev1.Container{
+			Name: "main",
+			Resources: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse(reqCPU),
+					corev1.ResourceMemory: resource.MustParse(reqMem),
+				},
+				Limits: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse(limCPU),
+					corev1.ResourceMemory: resource.MustParse(limMem),
+				},
+			},
+		}
+	}
+	sbxWithContainer := func(container *corev1.Container) *v1alpha1.Sandbox {
+		sbx := &v1alpha1.Sandbox{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              "test-sbx",
+				Namespace:         "default",
+				Annotations:       map[string]string{},
+				CreationTimestamp: metav1.Now(),
+			},
+		}
+		if container != nil {
+			sbx.Spec.Template = &corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{Containers: []corev1.Container{*container}},
+			}
+		}
+		return sbx
+	}
+	resourcesInplace := func(requests, limits map[corev1.ResourceName]string) *config.InplaceUpdateOptions {
+		parse := func(m map[corev1.ResourceName]string) corev1.ResourceList {
+			if len(m) == 0 {
+				return nil
+			}
+			rl := corev1.ResourceList{}
+			for name, q := range m {
+				rl[name] = resource.MustParse(q)
+			}
+			return rl
+		}
+		return &config.InplaceUpdateOptions{
+			Resources: &config.InplaceUpdateResourcesOptions{
+				Requests: parse(requests),
+				Limits:   parse(limits),
+			},
+		}
+	}
+
+	tests := []struct {
+		name            string
+		sbx             *v1alpha1.Sandbox
+		inplace         *config.InplaceUpdateOptions
+		expectErr       string
+		expectResizeErr bool
+	}{
+		{
+			name:    "no inplace update accepted",
+			sbx:     sbxWithContainer(ptr.To(memContainer("256Mi", ""))),
+			inplace: nil,
+		},
+		{
+			name:    "inplace update without resources accepted",
+			sbx:     sbxWithContainer(ptr.To(memContainer("256Mi", ""))),
+			inplace: &config.InplaceUpdateOptions{},
+		},
+		{
+			name:            "nil template with resize rejected",
+			sbx:             sbxWithContainer(nil),
+			inplace:         resourcesInplace(map[corev1.ResourceName]string{corev1.ResourceMemory: "128Mi"}, nil),
+			expectErr:       "no pod template",
+			expectResizeErr: true,
+		},
+		{
+			name:    "memory upscale accepted",
+			sbx:     sbxWithContainer(ptr.To(memContainer("256Mi", "512Mi"))),
+			inplace: resourcesInplace(map[corev1.ResourceName]string{corev1.ResourceMemory: "512Mi"}, map[corev1.ResourceName]string{corev1.ResourceMemory: "1Gi"}),
+		},
+		{
+			name:    "equal memory accepted",
+			sbx:     sbxWithContainer(ptr.To(memContainer("256Mi", ""))),
+			inplace: resourcesInplace(map[corev1.ResourceName]string{corev1.ResourceMemory: "256Mi"}, nil),
+		},
+		{
+			name:            "memory request downscale rejected",
+			sbx:             sbxWithContainer(ptr.To(memContainer("256Mi", ""))),
+			inplace:         resourcesInplace(map[corev1.ResourceName]string{corev1.ResourceMemory: "128Mi"}, nil),
+			expectErr:       "downscale",
+			expectResizeErr: true,
+		},
+		{
+			name:            "memory limit downscale rejected",
+			sbx:             sbxWithContainer(ptr.To(memContainer("", "512Mi"))),
+			inplace:         resourcesInplace(nil, map[corev1.ResourceName]string{corev1.ResourceMemory: "256Mi"}),
+			expectErr:       "downscale",
+			expectResizeErr: true,
+		},
+		{
+			name:            "request raised above existing limit rejected",
+			sbx:             sbxWithContainer(ptr.To(qosContainer("100m", "256Mi", "500m", "512Mi"))),
+			inplace:         resourcesInplace(map[corev1.ResourceName]string{corev1.ResourceCPU: "1"}, nil),
+			expectErr:       "above the container limit",
+			expectResizeErr: true,
+		},
+		{
+			name:            "qos class change rejected",
+			sbx:             sbxWithContainer(ptr.To(qosContainer("100m", "256Mi", "200m", "512Mi"))),
+			inplace:         resourcesInplace(map[corev1.ResourceName]string{corev1.ResourceCPU: "200m", corev1.ResourceMemory: "512Mi"}, nil),
+			expectErr:       "QoS class",
+			expectResizeErr: true,
+		},
+		{
+			name:    "qos class preserved accepted",
+			sbx:     sbxWithContainer(ptr.To(qosContainer("100m", "256Mi", "200m", "512Mi"))),
+			inplace: resourcesInplace(map[corev1.ResourceName]string{corev1.ResourceCPU: "200m"}, nil),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := preCheckCandidate(tt.sbx, tt.inplace)
+			if tt.expectErr == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.expectErr)
+			if tt.expectResizeErr {
+				var resizeErr *candidateResizeIncompatibleError
+				require.ErrorAs(t, err, &resizeErr)
+			}
+		})
+	}
+}
+
+func TestPickAnAvailableSandbox_ResizeCompatibilityUsesCandidateResources(t *testing.T) {
+	utestutils.InitLogOutput()
+
+	template := "test-resize-compat-template"
+	oldRevision := "rev-old"
+	newRevision := "rev-new"
+
+	newCandidate := func(name, templateHash, reqMem string) *v1alpha1.Sandbox {
+		return &v1alpha1.Sandbox{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name,
+				Namespace: "default",
+				Labels: map[string]string{
+					v1alpha1.LabelSandboxTemplate:  template,
+					v1alpha1.LabelSandboxIsClaimed: "false",
+					v1alpha1.LabelTemplateHash:     templateHash,
+				},
+				Annotations:       map[string]string{},
+				CreationTimestamp: metav1.Now(),
+				OwnerReferences:   GetSbsOwnerReference(),
+			},
+			Spec: v1alpha1.SandboxSpec{
+				EmbeddedSandboxTemplate: v1alpha1.EmbeddedSandboxTemplate{
+					Template: &corev1.PodTemplateSpec{
+						Spec: corev1.PodSpec{
+							Containers: []corev1.Container{{
+								Name: "main",
+								Resources: corev1.ResourceRequirements{
+									Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse(reqMem)},
+								},
+							}},
+						},
+					},
+				},
+			},
+			Status: v1alpha1.SandboxStatus{
+				Phase:      v1alpha1.SandboxRunning,
+				Conditions: []metav1.Condition{{Type: string(v1alpha1.SandboxConditionReady), Status: metav1.ConditionTrue}},
+				PodInfo:    v1alpha1.PodInfo{PodIP: "1.2.3.4"},
+			},
+		}
+	}
+
+	setup := func(t *testing.T) (*Infra, client.Client) {
+		testInfra, c := NewTestInfra(t)
+		// Rollout in progress: template memory raised to 1Gi, old sandboxes still lower.
+		sbs := &v1alpha1.SandboxSet{
+			ObjectMeta: metav1.ObjectMeta{Name: template, Namespace: "default"},
+			Spec: v1alpha1.SandboxSetSpec{
+				Replicas: 1,
+				EmbeddedSandboxTemplate: v1alpha1.EmbeddedSandboxTemplate{
+					Template: &corev1.PodTemplateSpec{
+						Spec: corev1.PodSpec{
+							Containers: []corev1.Container{{
+								Name: "main",
+								Resources: corev1.ResourceRequirements{
+									Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("1Gi")},
+								},
+							}},
+						},
+					},
+				},
+			},
+			Status: v1alpha1.SandboxSetStatus{UpdateRevision: newRevision},
+		}
+		require.NoError(t, c.Create(t.Context(), sbs))
+		require.NoError(t, c.Status().Update(t.Context(), sbs))
+		return testInfra, c
+	}
+
+	waitPool := func(t *testing.T, testInfra *Infra, count int) {
+		require.Eventually(t, func() bool {
+			objs, err := testInfra.Cache.ListSandboxesInPool(t.Context(), infracache.ListSandboxesInPoolOptions{Pool: template})
+			return err == nil && len(objs) == count
+		}, 200*time.Millisecond, 5*time.Millisecond)
+	}
+
+	t.Run("old revision candidate below new template memory stays claimable", func(t *testing.T) {
+		testInfra, c := setup(t)
+		CreateSandboxWithStatus(t, c, newCandidate("old-512mi", oldRevision, "512Mi"))
+		waitPool(t, testInfra, 1)
+
+		opts, err := ValidateAndInitClaimOptions(infra.ClaimSandboxOptions{
+			Namespace: "default",
+			User:      "test-user",
+			Template:  template,
+			InplaceUpdate: &config.InplaceUpdateOptions{
+				Resources: &config.InplaceUpdateResourcesOptions{
+					Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("768Mi")},
+				},
+			},
+		})
+		require.NoError(t, err)
+
+		sbx, lockType, err := pickAnAvailableSandbox(t.Context(), opts, &testInfra.pickCache, testInfra.Cache)
+		require.NoError(t, err)
+		require.Equal(t, infra.LockTypeUpdate, lockType)
+		assert.Equal(t, "old-512mi", sbx.GetName())
+	})
+
+	t.Run("all candidates resize incompatible returns retriable no-available error", func(t *testing.T) {
+		testInfra, c := setup(t)
+		CreateSandboxWithStatus(t, c, newCandidate("old-1gi", oldRevision, "1Gi"))
+		waitPool(t, testInfra, 1)
+
+		opts, err := ValidateAndInitClaimOptions(infra.ClaimSandboxOptions{
+			Namespace: "default",
+			User:      "test-user",
+			Template:  template,
+			InplaceUpdate: &config.InplaceUpdateOptions{
+				Resources: &config.InplaceUpdateResourcesOptions{
+					Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("512Mi")},
+				},
+			},
+		})
+		require.NoError(t, err)
+
+		_, _, err = pickAnAvailableSandbox(t.Context(), opts, &testInfra.pickCache, testInfra.Cache)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "downscale")
+		assert.Contains(t, err.Error(), "inplace resize")
+		var retriable retriableError
+		assert.True(t, errors.As(err, &retriable), "resize-incompatible pool must stay retriable")
+	})
+
+	t.Run("locked candidates keep the generic no-available path", func(t *testing.T) {
+		testInfra, c := setup(t)
+		locked := newCandidate("locked-1gi", oldRevision, "1Gi")
+		locked.Annotations[v1alpha1.AnnotationLock] = "someone-else"
+		CreateSandboxWithStatus(t, c, locked)
+		waitPool(t, testInfra, 1)
+
+		opts, err := ValidateAndInitClaimOptions(infra.ClaimSandboxOptions{
+			Namespace: "default",
+			User:      "test-user",
+			Template:  template,
+			InplaceUpdate: &config.InplaceUpdateOptions{
+				Resources: &config.InplaceUpdateResourcesOptions{
+					Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("512Mi")},
+				},
+			},
+		})
+		require.NoError(t, err)
+
+		_, _, err = pickAnAvailableSandbox(t.Context(), opts, &testInfra.pickCache, testInfra.Cache)
+		require.Error(t, err)
+		assert.NotContains(t, err.Error(), "inplace resize")
+		var retriable retriableError
+		assert.True(t, errors.As(err, &retriable))
+	})
 }
 
 func TestModifyPickedSandbox_InitRuntime(t *testing.T) {

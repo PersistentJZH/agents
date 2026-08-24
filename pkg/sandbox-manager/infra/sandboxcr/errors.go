@@ -79,6 +79,21 @@ func (e terminalValidationError) Unwrap() error {
 	return e.err
 }
 
+// candidateResizeIncompatibleError marks a candidate that cannot serve the
+// requested resize. pickAnAvailableSandbox records the skip reason so it can
+// be surfaced in the no-available error; skips never terminate the claim.
+type candidateResizeIncompatibleError struct {
+	err error
+}
+
+func (e *candidateResizeIncompatibleError) Error() string {
+	return e.err.Error()
+}
+
+func (e *candidateResizeIncompatibleError) Unwrap() error {
+	return e.err
+}
+
 // classifyCreateError classifies a Kubernetes API error from a Create
 // operation into one of three categories:
 // - ambiguous: transient server errors, conflicts, network errors -> managererrors.Error{ErrorInternal}

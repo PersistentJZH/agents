@@ -128,7 +128,12 @@ func ValidateResizeResources(requests, limits corev1.ResourceList) error {
 	}
 	unknown := unsupportedResourceNames(requests, limits)
 	if len(unknown) > 0 {
-		return managererrors.NewError(managererrors.ErrorBadRequest, "resource %s is not supported for in-place resize", unknown[0])
+		names := make([]string, 0, len(unknown))
+		for _, name := range unknown {
+			names = append(names, string(name))
+		}
+		return managererrors.NewError(managererrors.ErrorBadRequest,
+			"resources %s are not supported for in-place resize", strings.Join(names, ", "))
 	}
 	for _, name := range []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory} {
 		if quantity, ok := requests[name]; ok {
@@ -151,8 +156,8 @@ func ValidateResizeResources(requests, limits corev1.ResourceList) error {
 }
 
 // unsupportedResourceNames returns the sorted resource names present in the
-// given lists that are not allowed for in-place resize, so the reported name
-// is deterministic even with several invalid keys.
+// given lists that are not allowed for in-place resize, so all invalid keys
+// can be reported deterministically.
 func unsupportedResourceNames(requests, limits corev1.ResourceList) []corev1.ResourceName {
 	seen := make(map[corev1.ResourceName]struct{}, len(requests)+len(limits))
 	for name := range requests {
@@ -589,9 +594,12 @@ func pickAnAvailableSandbox(ctx context.Context, opts infra.ClaimSandboxOptions,
 		updateRevision = sbs.Status.UpdateRevision
 	}
 
-	// Select available candidates and speculated creating sandboxes
+	// Select available and speculated candidates. Track the resize-incompatible
+	// skip reason so it can be surfaced when nothing else is available; resize
+	// skips never terminate the claim because the pool changes over time.
 	availableCandidates := make([]*v1alpha1.Sandbox, 0, cnt)
 	speculatingCandidates := make([]*v1alpha1.Sandbox, 0, cnt)
+	var resizeSkipReason error
 	for _, obj := range objects {
 		if len(availableCandidates) >= cnt {
 			if opts.SpeculateCreatingDuration == 0 || len(speculatingCandidates) >= cnt {
@@ -602,8 +610,12 @@ func pickAnAvailableSandbox(ctx context.Context, opts infra.ClaimSandboxOptions,
 			log.Info("skip out-dated sandbox cache", "sandbox", klog.KObj(obj))
 			continue
 		}
-		if checkErr := preCheckCandidate(obj); checkErr != nil {
+		if checkErr := preCheckCandidate(obj, opts.InplaceUpdate); checkErr != nil {
 			log.Error(checkErr, "skip invalid sandbox", "sandbox", klog.KObj(obj), "resourceVersion", obj.GetResourceVersion())
+			var resizeIncompatible *candidateResizeIncompatibleError
+			if errors.As(checkErr, &resizeIncompatible) {
+				resizeSkipReason = checkErr
+			}
 			continue
 		}
 		state, _ := utils.GetSandboxState(obj)
@@ -675,6 +687,11 @@ func pickAnAvailableSandbox(ctx context.Context, opts infra.ClaimSandboxOptions,
 		log.Info("will create a new sandbox")
 		return newSandboxFromSandboxSet(ctx, opts, cache)
 	}
+	if resizeSkipReason != nil && len(availableCandidates) == 0 && len(speculatingCandidates) == 0 {
+		// Keep the error retriable: the pool changes over time (rollout, scale-up).
+		log.Info("no candidate compatible with inplace resize", "reason", resizeSkipReason)
+		return nil, "", NoAvailableError(template, fmt.Sprintf("no candidate compatible with inplace resize: %v", resizeSkipReason))
+	}
 	return nil, "", NoAvailableError(template, pickErr.Error())
 }
 
@@ -745,13 +762,54 @@ func newSandboxFromSandboxSet(ctx context.Context, opts infra.ClaimSandboxOption
 	return AsSandbox(sbx, cache), infra.LockTypeCreate, nil
 }
 
-func preCheckCandidate(sbx *v1alpha1.Sandbox) error {
+// preCheckCandidate rejects locked sandboxes, objects without a creation
+// timestamp, and — for resize claims — candidates whose own resources cannot
+// serve the resize (memory downscale or QoS class change). Comparing against
+// the candidate's own template keeps old-revision sandboxes claimable during
+// a SandboxSet rollout.
+func preCheckCandidate(sbx *v1alpha1.Sandbox, inplace *config.InplaceUpdateOptions) error {
 	lock := sbx.Annotations[v1alpha1.AnnotationLock]
 	if lock != "" {
 		return fmt.Errorf("sandbox is locked by %s", lock)
 	}
 	if sbx.CreationTimestamp.IsZero() {
 		return errors.New("creation timestamp is zero")
+	}
+	if inplace != nil && inplace.Resources != nil {
+		if err := checkCandidateResize(sbx, inplace.Resources.Requests, inplace.Resources.Limits); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// checkCandidateResize verifies that the candidate can serve the requested
+// resize, mirroring what SetResources later applies to the first container.
+// Rejected conditions: no pod template, memory downscale, merged request above
+// limit, or a QoS class change.
+//
+// QoS is evaluated against the candidate's template, not the live pod, so
+// injected sidecar/admission resources may make this check skip a candidate
+// conservatively; a false skip only costs a retry.
+func checkCandidateResize(sbx *v1alpha1.Sandbox, requests, limits corev1.ResourceList) error {
+	if sbx.Spec.Template == nil || len(sbx.Spec.Template.Spec.Containers) == 0 {
+		return &candidateResizeIncompatibleError{err: managererrors.NewError(
+			managererrors.ErrorBadRequest,
+			"cannot apply in-place resize: sandbox has no pod template")}
+	}
+	// DeepCopy to avoid mutating informer-cached objects.
+	current := (&corev1.Pod{Spec: sbx.Spec.Template.Spec}).DeepCopy()
+	resized := current.DeepCopy()
+	if _, err := setContainerResources(&resized.Spec.Containers[0], requests, limits); err != nil {
+		return &candidateResizeIncompatibleError{err: err}
+	}
+	resizedBox := &v1alpha1.Sandbox{}
+	resizedBox.Spec.Template = &corev1.PodTemplateSpec{Spec: resized.Spec}
+	orig, updated, changed := inplaceupdate.CheckResizeQoSChange(resizedBox, current)
+	if changed {
+		return &candidateResizeIncompatibleError{err: managererrors.NewError(
+			managererrors.ErrorBadRequest,
+			"in-place resize would change pod QoS class from %s to %s", orig, updated)}
 	}
 	return nil
 }
@@ -820,12 +878,12 @@ func modifyPickedSandbox(sbx *Sandbox, lockType infra.LockType, opts infra.Claim
 	return nil
 }
 
-// SetResources applies in-place resource resize to the first container.
-// It returns an error when the requested memory would lower the container's
-// current memory, since in-place memory downscale is not supported.
+// SetResources applies in-place resource resize to the first container. It
+// errors on memory downscale or when the sandbox has no pod template.
 func (s *Sandbox) SetResources(requests, limits corev1.ResourceList) error {
 	if s.Spec.Template == nil {
-		return nil
+		return managererrors.NewError(managererrors.ErrorBadRequest,
+			"cannot apply in-place resize: sandbox has no pod template")
 	}
 	pod := &corev1.Pod{
 		Spec: s.Spec.Template.Spec,
@@ -947,6 +1005,17 @@ func setContainerResources(container *corev1.Container, requests, limits corev1.
 		}
 		container.Resources.Limits[resName] = target.DeepCopy()
 		changed = true
+	}
+	// Reject merged request > limit; the apiserver would reject the pod update
+	// anyway, but only after the sandbox is already locked.
+	for _, resName := range []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory} {
+		req, hasReq := container.Resources.Requests[resName]
+		lim, hasLim := container.Resources.Limits[resName]
+		if hasReq && hasLim && !req.IsZero() && !lim.IsZero() && req.Cmp(lim) > 0 {
+			return false, managererrors.NewError(managererrors.ErrorBadRequest,
+				"in-place resize would set %s request %s above the container limit %s",
+				resName, req.String(), lim.String())
+		}
 	}
 	return changed, nil
 }

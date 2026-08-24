@@ -1008,12 +1008,14 @@ func TestCreateSandbox_MemoryOverridePropagatedToClaimedSandbox(t *testing.T) {
 		Scope:     quotaspec.ScopeRunning,
 		Limit:     10,
 	}})
+	// Keep requests == limits so the resize preserves the pool's Guaranteed QoS
+	// class; a request/limit split would change QoS and be rejected.
 	resp, apiErr := controller.CreateSandbox(NewRequest(t, nil, models.NewSandboxRequest{
 		TemplateID: "memory-override-tmpl",
 		Metadata: map[string]string{
 			models.ExtensionKeySkipInitRuntime:        v1alpha1.True,
 			models.ExtensionKeyClaimWithMemoryRequest: "512Mi",
-			models.ExtensionKeyClaimWithMemoryLimit:   "1Gi",
+			models.ExtensionKeyClaimWithMemoryLimit:   "512Mi",
 		},
 	}, nil, user))
 
@@ -1028,7 +1030,7 @@ func TestCreateSandbox_MemoryOverridePropagatedToClaimedSandbox(t *testing.T) {
 	claimed := GetSandbox(t, resp.Body.SandboxID, client)
 	resources := claimed.Spec.Template.Spec.Containers[0].Resources
 	assert.Equal(t, resource.MustParse("512Mi"), resources.Requests[corev1.ResourceMemory])
-	assert.Equal(t, resource.MustParse("1Gi"), resources.Limits[corev1.ResourceMemory])
+	assert.Equal(t, resource.MustParse("512Mi"), resources.Limits[corev1.ResourceMemory])
 	// Unrelated resources must be preserved by the memory override.
 	assert.Equal(t, resource.MustParse("100m"), resources.Requests[corev1.ResourceCPU])
 }

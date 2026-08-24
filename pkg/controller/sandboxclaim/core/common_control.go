@@ -44,7 +44,6 @@ import (
 	annotationutils "github.com/openkruise/agents/pkg/utils/annotations"
 	"github.com/openkruise/agents/pkg/utils/csiutils"
 	utilfeature "github.com/openkruise/agents/pkg/utils/feature"
-	"github.com/openkruise/agents/pkg/utils/inplaceupdate"
 	runtimeclient "github.com/openkruise/agents/pkg/utils/runtime"
 	"github.com/openkruise/agents/pkg/utils/timeout"
 )
@@ -147,7 +146,10 @@ func (c *commonControl) EnsureClaimClaiming(ctx context.Context, args ClaimArgs)
 
 	// Step 7.1: Validate the inplace update request up front so invalid input
 	// fails fast with an accurate reason instead of spinning until
-	// ClaimTimeout with a misleading NoAvailableSandboxes event.
+	// ClaimTimeout with a misleading NoAvailableSandboxes event. Only
+	// sandbox-independent rules are checked here; revision-dependent checks
+	// (memory downscale, QoS class change) run per candidate in
+	// sandboxcr.preCheckCandidate.
 	if claim.Spec.InplaceUpdate != nil && claim.Spec.InplaceUpdate.Resources != nil {
 		res := claim.Spec.InplaceUpdate.Resources
 		if err := sandboxcr.ValidateResizeResources(res.Requests, res.Limits); err != nil {
@@ -156,18 +158,6 @@ func (c *commonControl) EnsureClaimClaiming(ctx context.Context, args ClaimArgs)
 			c.recorder.Event(claim, "Warning", "InvalidInplaceUpdateResources", msg)
 			TransitionToCompleted(args.NewStatus, "InvalidInplaceUpdateResources", msg)
 			return NoRequeue(), nil
-		}
-		if sandboxSet.Spec.Template != nil {
-			for i := range sandboxSet.Spec.Template.Spec.Containers {
-				templateContainer := &sandboxSet.Spec.Template.Spec.Containers[i]
-				if err := inplaceupdate.CheckContainerMemoryDownscale(templateContainer, res.Requests, res.Limits); err != nil {
-					msg := fmt.Sprintf("container %q: %v", templateContainer.Name, err)
-					log.Info(msg)
-					c.recorder.Event(claim, "Warning", "MemoryDownscaleNotSupported", msg)
-					TransitionToCompleted(args.NewStatus, "MemoryDownscaleNotSupported", msg)
-					return NoRequeue(), nil
-				}
-			}
 		}
 	}
 
